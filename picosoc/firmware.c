@@ -35,7 +35,10 @@ extern uint32_t sram;
 #define reg_spictrl (*(volatile uint32_t*)0x02000000)
 #define reg_uart_clkdiv (*(volatile uint32_t*)0x02000004)
 #define reg_uart_data (*(volatile uint32_t*)0x02000008)
+// GPIO at 0x03000000
+// [7:0] = LEDs, [15:8] = 7-segment display
 #define reg_leds (*(volatile uint32_t*)0x03000000)
+#define reg_7seg (*(volatile uint8_t*)0x03000001)
 
 // --------------------------------------------------------
 
@@ -178,43 +181,16 @@ void print_hex(uint32_t v, int digits)
 	}
 }
 
+// Print uint32_t as decimal. Original was a hardcoded if-else chain capped at 999,
+// because -nostdlib means no libgcc (no __udivsi3). With -march=rv32im the compiler
+// emits hardware div/rem instructions directly, so modulo just works.
 void print_dec(uint32_t v)
 {
-	if (v >= 1000) {
-		print(">=1000");
-		return;
-	}
-
-	if      (v >= 900) { putchar('9'); v -= 900; }
-	else if (v >= 800) { putchar('8'); v -= 800; }
-	else if (v >= 700) { putchar('7'); v -= 700; }
-	else if (v >= 600) { putchar('6'); v -= 600; }
-	else if (v >= 500) { putchar('5'); v -= 500; }
-	else if (v >= 400) { putchar('4'); v -= 400; }
-	else if (v >= 300) { putchar('3'); v -= 300; }
-	else if (v >= 200) { putchar('2'); v -= 200; }
-	else if (v >= 100) { putchar('1'); v -= 100; }
-
-	if      (v >= 90) { putchar('9'); v -= 90; }
-	else if (v >= 80) { putchar('8'); v -= 80; }
-	else if (v >= 70) { putchar('7'); v -= 70; }
-	else if (v >= 60) { putchar('6'); v -= 60; }
-	else if (v >= 50) { putchar('5'); v -= 50; }
-	else if (v >= 40) { putchar('4'); v -= 40; }
-	else if (v >= 30) { putchar('3'); v -= 30; }
-	else if (v >= 20) { putchar('2'); v -= 20; }
-	else if (v >= 10) { putchar('1'); v -= 10; }
-
-	if      (v >= 9) { putchar('9'); v -= 9; }
-	else if (v >= 8) { putchar('8'); v -= 8; }
-	else if (v >= 7) { putchar('7'); v -= 7; }
-	else if (v >= 6) { putchar('6'); v -= 6; }
-	else if (v >= 5) { putchar('5'); v -= 5; }
-	else if (v >= 4) { putchar('4'); v -= 4; }
-	else if (v >= 3) { putchar('3'); v -= 3; }
-	else if (v >= 2) { putchar('2'); v -= 2; }
-	else if (v >= 1) { putchar('1'); v -= 1; }
-	else putchar('0');
+	char buf[10];
+	int i = 0;
+	if (v == 0) { putchar('0'); return; }
+	while (v > 0) { buf[i++] = '0' + (v % 10); v /= 10; }
+	while (i > 0) putchar(buf[--i]);
 }
 
 char getchar_prompt(char *prompt)
@@ -449,6 +425,8 @@ void cmd_read_flash_regs()
 
 // --------------------------------------------------------
 
+// Original PicoSoC benchmark. Runs a fixed workload, prints results in hex.
+// Used by cmd_benchmark_all() to compare flash modes (returns cycle count).
 uint32_t cmd_benchmark(bool verbose, uint32_t *instns_p)
 {
 	uint8_t data[256];
@@ -505,6 +483,77 @@ uint32_t cmd_benchmark(bool verbose, uint32_t *instns_p)
 		*instns_p = instns_end - instns_begin;
 
 	return cycles_end - cycles_begin;
+}
+
+// TODO: Workload function matching the project benchmark template.
+// Replace the body with your actual workload; return value is
+// displayed on the 7-segment display.
+unsigned char run_workload(void)
+{
+	uint8_t data[256];
+	uint32_t x32 = 314159265;
+
+	for (int k = 0; k < 256; k++) {
+		x32 ^= x32 << 13;
+		x32 ^= x32 >> 17;
+		x32 ^= x32 << 5;
+		data[k] = x32;
+	}
+
+	for (int k = 0, p = 0; k < 256; k++) {
+		if (data[k])
+			data[p++] = k;
+	}
+
+	return (unsigned char)x32;
+}
+
+// GB3 Project CPI benchmark. Runs run_workload() in an infinite loop:
+//  - Measures cycles and instructions via rdcycle/rdinstret CSRs
+//  - Prints cycles, instructions, CPI (2 decimal places) over UART
+//  - Toggles LED1 each iteration for Picoscope timing measurement
+//  - Writes return value to 7-seg (prevents compiler optimizing away the call)
+void cmd_benchmark_cpi()
+{
+	uint32_t cycles_begin, cycles_end;
+	uint32_t instns_begin, instns_end;
+	uint8_t leds_val = 0x02;
+
+	print("Running CPI benchmark (press any key to stop)...\n");
+
+	while (1) {
+		if ((int32_t)reg_uart_data != -1) return;
+		__asm__ volatile ("rdcycle %0" : "=r"(cycles_begin));
+		__asm__ volatile ("rdinstret %0" : "=r"(instns_begin));
+
+		reg_7seg = run_workload();
+
+		__asm__ volatile ("rdcycle %0" : "=r"(cycles_end));
+		__asm__ volatile ("rdinstret %0" : "=r"(instns_end));
+
+		reg_leds = leds_val;
+		leds_val ^= 0x02;
+
+		uint32_t cyc = cycles_end - cycles_begin;
+		uint32_t ins = instns_end - instns_begin;
+
+		print("cycles=");
+		print_dec(cyc);
+		print(" instrs=");
+		print_dec(ins);
+
+		// CPI with 2 decimal places via integer math: cyc*100/ins
+		if (ins > 0) {
+			uint32_t cpi100 = cyc * 100 / ins;
+			print(" CPI=");
+			print_dec(cpi100 / 100);
+			putchar('.');
+			uint32_t frac = cpi100 % 100;
+			if (frac < 10) putchar('0');
+			print_dec(frac);
+		}
+		print("\n");
+	}
 }
 
 // --------------------------------------------------------
@@ -663,16 +712,26 @@ void cmd_echo()
 
 // --------------------------------------------------------
 
-void main()
+// Hardware boot sequence:
+// QSPI flash mode (in original firmware), uart baud rate, clear led and 7seg outputs.
+// LEDs show progress (1 -> 3 -> 7) matching start.s convention.
+void boot()
 {
 	reg_leds = 31;
-	reg_uart_clkdiv = 104;
-	print("Booting..\n");
+	reg_uart_clkdiv = 104;  // 12 MHz / 115200 baud
+	reg_7seg = 0x00;
 
 	reg_leds = 63;
 	set_flash_qspi_flag();
 
 	reg_leds = 127;
+}
+
+void main()
+{
+	boot();
+	print("Booting..\n");
+
 	while (getchar_prompt("Press ENTER to continue..\n") != '\r') { /* wait */ }
 
 	print("\n");
@@ -711,6 +770,7 @@ void main()
 		print("   [0] Benchmark all configs\n");
 		print("   [M] Run Memtest\n");
 		print("   [S] Print SPI state\n");
+		print("   [B] CPI benchmark \n");
 		print("   [e] Echo UART\n");
 		print("\n");
 
@@ -757,6 +817,9 @@ void main()
 			case 'S':
 				cmd_print_spi_state();
 				break;
+			case 'B':
+				cmd_benchmark_cpi();
+				break;  // never reached (loops forever)
 			case 'e':
 				cmd_echo();
 				break;

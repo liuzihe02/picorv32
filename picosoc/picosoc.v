@@ -106,6 +106,11 @@ module picosoc (
 	wire spimem_ready;
 	wire [31:0] spimem_rdata;
 
+	wire cache_ready;
+	wire [31:0] cache_rdata;
+	wire spi_req_valid;
+	wire [23:0] spi_req_addr;
+
 	reg ram_ready;
 	wire [31:0] ram_rdata;
 
@@ -124,10 +129,10 @@ module picosoc (
 	wire [31:0] simpleuart_reg_dat_do;
 	wire        simpleuart_reg_dat_wait;
 
-	assign mem_ready = (iomem_valid && iomem_ready) || spimem_ready || ram_ready || spimemio_cfgreg_sel ||
+	assign mem_ready = (iomem_valid && iomem_ready) || cache_ready || ram_ready || spimemio_cfgreg_sel ||
 			simpleuart_reg_div_sel || (simpleuart_reg_dat_sel && !simpleuart_reg_dat_wait);
 
-	assign mem_rdata = (iomem_valid && iomem_ready) ? iomem_rdata : spimem_ready ? spimem_rdata : ram_ready ? ram_rdata :
+	assign mem_rdata = (iomem_valid && iomem_ready) ? iomem_rdata : cache_ready ? cache_rdata : ram_ready ? ram_rdata :
 			spimemio_cfgreg_sel ? spimemio_cfgreg_do : simpleuart_reg_div_sel ? simpleuart_reg_div_do :
 			simpleuart_reg_dat_sel ? simpleuart_reg_dat_do : 32'h 0000_0000;
 
@@ -156,12 +161,25 @@ module picosoc (
 		.irq         (irq        )
 	);
 
+	icache icache0 (
+		.clk      (clk),
+		.resetn   (resetn),
+		.cpu_valid(mem_valid && mem_addr >= 4*MEM_WORDS && mem_addr < 32'h 0200_0000),
+		.cpu_addr (mem_addr[23:0]),
+		.cpu_ready(cache_ready),
+		.cpu_rdata(cache_rdata),
+		.spi_valid(spi_req_valid),
+		.spi_addr (spi_req_addr),
+		.spi_ready(spimem_ready),
+		.spi_rdata(spimem_rdata)
+	);
+
 	spimemio spimemio (
 		.clk    (clk),
 		.resetn (resetn),
-		.valid  (mem_valid && mem_addr >= 4*MEM_WORDS && mem_addr < 32'h 0200_0000),
+		.valid  (spi_req_valid),
 		.ready  (spimem_ready),
-		.addr   (mem_addr[23:0]),
+		.addr   (spi_req_addr),
 		.rdata  (spimem_rdata),
 
 		.flash_csb    (flash_csb   ),

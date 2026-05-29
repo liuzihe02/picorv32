@@ -121,12 +121,13 @@ module icebreaker (
 		end
 	end
 
-
+// TODO: modify the iceb chip configurations here
 	picosoc #(
 		.BARREL_SHIFTER(0),
 		.ENABLE_MUL(0),
-		.ENABLE_DIV(0),
+		.ENABLE_DIV(1),        // on: rv32im emits div/rem
 		.ENABLE_FAST_MUL(1),
+		.ENABLE_COMPRESSED(0), // off: rv32im has no C extension
 		.MEM_WORDS(MEM_WORDS)
 	) soc (
 		.clk          (clk         ),

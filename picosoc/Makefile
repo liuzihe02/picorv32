@@ -1,5 +1,8 @@
 
-CROSS=riscv32-unknown-elf-
+#as in GB3 ipynb, modify this line to where the GNU toolchain is installed
+#on eitl PCs this is `CROSS=/usr/local/apps/GB3-RISCV/riscv32imc/bin/riscv32-unknown-elf-`
+CROSS=/opt/riscv32imc/bin/riscv32-unknown-elf-
+
 CFLAGS=
 
 # ---- iCE40 HX8K Breakout Board ----
@@ -85,8 +88,9 @@ icebprog_fw: icebreaker_fw.bin
 icebreaker_sections.lds: sections.lds
 	$(CROSS)cpp -P -DICEBREAKER -o $@ $^
 
+#compile firmware with rv32im (not rv32ic) as required
 icebreaker_fw.elf: icebreaker_sections.lds start.s firmware.c
-	$(CROSS)gcc $(CFLAGS) -DICEBREAKER -mabi=ilp32 -march=rv32ic -Wl,-Bstatic,-T,icebreaker_sections.lds,--strip-debug -ffreestanding -nostdlib -o icebreaker_fw.elf start.s firmware.c
+	$(CROSS)gcc $(CFLAGS) -DICEBREAKER -mabi=ilp32 -march=rv32im -Wl,-Bstatic,-T,icebreaker_sections.lds,--strip-debug -ffreestanding -nostdlib -o icebreaker_fw.elf start.s firmware.c
 
 icebreaker_fw.hex: icebreaker_fw.elf
 	$(CROSS)objcopy -O verilog icebreaker_fw.elf icebreaker_fw.hex

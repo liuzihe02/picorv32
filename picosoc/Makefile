@@ -1,7 +1,8 @@
 
 #as in GB3 ipynb, modify this line to where the GNU toolchain is installed
 #on eitl PCs this is `CROSS=/usr/local/apps/GB3-RISCV/riscv32imc/bin/riscv32-unknown-elf-`
-CROSS=/opt/riscv32imc/bin/riscv32-unknown-elf-
+# for mac, set environment variable `export RISCV_GNU_TOOLCHAIN_INSTALL_PREFIX=/opt/homebrew/opt/riscv-gnu-toolchain/main` and then use `$(RISCV_GNU_TOOLCHAIN_INSTALL_PREFIX)/bin/riscv32-unknown-elf-` in the Makefile as shown below
+CROSS=$(RISCV_GNU_TOOLCHAIN_INSTALL_PREFIX)/bin/riscv32-unknown-elf-
 
 CFLAGS=
 

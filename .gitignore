@@ -35,3 +35,6 @@
 /synth.log
 /synth.v
 .*.swp
+
+#ignore pycache
+__pycache__/

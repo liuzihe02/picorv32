@@ -76,6 +76,7 @@ module picosoc (
 	parameter [0:0] ENABLE_COMPRESSED = 1;
 	parameter [0:0] ENABLE_COUNTERS = 1;
 	parameter [0:0] ENABLE_IRQ_QREGS = 0;
+	parameter [0:0] ENABLE_ICACHE = 1;   //default icache on
 
 	parameter integer MEM_WORDS = 256;
 	parameter [31:0] STACKADDR = (4*MEM_WORDS);       // end of memory
@@ -161,18 +162,29 @@ module picosoc (
 		.irq         (irq        )
 	);
 
-	icache icache0 (
-		.clk      (clk),
-		.resetn   (resetn),
-		.cpu_valid(mem_valid && mem_addr >= 4*MEM_WORDS && mem_addr < 32'h 0200_0000),
-		.cpu_addr (mem_addr[23:0]),
-		.cpu_ready(cache_ready),
-		.cpu_rdata(cache_rdata),
-		.spi_valid(spimem_valid),
-		.spi_addr (spimem_addr),
-		.spi_ready(spimem_ready),
-		.spi_rdata(spimem_rdata)
-	);
+	// generate = compile-time (elaboration) picks which hardware is built before synthesis. Only one branch exists in the netlist; the other is excluded entirely (no LUTs/EBR).
+	// Unlike a runtime `if`, this can add/remove module instances and continuous assigns.
+	generate if (ENABLE_ICACHE) begin : icache_gen
+		// Cached path: icache intercepts flash-region fetches, forwards misses to spimemio.
+		icache icache0 (
+			.clk      (clk),
+			.resetn   (resetn),
+			.cpu_valid(mem_valid && mem_addr >= 4*MEM_WORDS && mem_addr < 32'h 0200_0000),
+			.cpu_addr (mem_addr[23:0]),
+			.cpu_ready(cache_ready),
+			.cpu_rdata(cache_rdata),
+			.spi_valid(spimem_valid),
+			.spi_addr (spimem_addr),
+			.spi_ready(spimem_ready),
+			.spi_rdata(spimem_rdata)
+		);
+	end else begin : nocache
+		// Bypass: CPU flash-region requests go straight to spimemio (pre-icache path).
+		assign spimem_valid = mem_valid && mem_addr >= 4*MEM_WORDS && mem_addr < 32'h 0200_0000;
+		assign spimem_addr  = mem_addr[23:0];
+		assign cache_ready  = spimem_ready;
+		assign cache_rdata  = spimem_rdata;
+	end endgenerate
 
 	spimemio spimemio (
 		.clk    (clk),

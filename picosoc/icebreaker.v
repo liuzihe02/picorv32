@@ -128,6 +128,7 @@ module icebreaker (
 		.ENABLE_DIV(1),        // on: rv32im emits div/rem
 		.ENABLE_FAST_MUL(1),
 		.ENABLE_COMPRESSED(0), // off: rv32im has no C extension
+		.ENABLE_ICACHE(0),     // 1: instruction cache on; 0: direct flash fetch (baseline)
 		.MEM_WORDS(MEM_WORDS)
 	) soc (
 		.clk          (clk         ),

@@ -2,7 +2,10 @@
 
 This is a design document containing brief background and implementation plan for the GB3 RISC-V Project. For detailed technical background on microarchitecture and details of `picorv32`, please refer to the [technical deep dive](guide/guide.pdf) that Zach maintains.
 
-> Zach reccomends using [markdown-preview-enhanced](https://shd101wyy.github.io/markdown-preview-enhanced/#/) to view md files.
+## Tips
+
+- Zach reccomends using [markdown-preview-enhanced](https://shd101wyy.github.io/markdown-preview-enhanced/#/) to view md files.
+- Instead of using `screen /dev/ttyUSB1 115200` which can screw up scrolling with mouse and copying, install and use `tio -b 115200 /dev/ttyUSB1` which simply prints to terminal
 
 ## Core Files (For LLM context)
 
@@ -12,38 +15,41 @@ This will almost always require a model with at least 500K token context window.
 
 Tier 1 Files
 
-| File | Lines | Role |
-| --- | ---: | --- |
-| `picorv32.v` | 3049 | CPU core. Main module `picorv32`; also `picorv32_pcpi_mul/fast_mul/div`, `picorv32_regs`, `picorv32_axi`, `picorv32_wb`. |
-| `picosoc/spimemio.v` | 579 | SPI flash controller — the dominant fetch-latency block: fast-read reset defaults, jump penalty, line-buffer / I-cache insertion point. |
-| `picosoc/icebreaker.v` | 240 | Top-level for the iCEBreaker board: instantiates `picosoc` (iCE40UP5K config, SPRAM, 7-seg; no PLL, raw 12 MHz). Current rv32im params: `BARREL_SHIFTER=0`, `ENABLE_MUL=0`, `ENABLE_DIV=1`, `ENABLE_FAST_MUL=1`, `ENABLE_COMPRESSED=0`. |
-| `picosoc/picosoc.v` | 262 | SoC wrapper. Wires CPU to SRAM, UART, SPI flash, GPIO. Address decode + memory map live here (the cache sits on this bus). |
-| `README.md` | — | Full documentation of all configuration parameters. |
-| `picosoc/README.md` | — | picosoc documentation. |
+| File | Role |
+| --- | --- |
+| `picorv32.v` | CPU core. Main module `picorv32`; also `picorv32_pcpi_mul/fast_mul/div`, `picorv32_regs`, `picorv32_axi`, `picorv32_wb`. |
+| `picosoc/spimemio.v` | SPI flash controller — the dominant fetch-latency block: fast-read reset defaults, jump penalty, line-buffer insertion point. |
+| `picosoc/icebreaker.v` | Top-level for the iCEBreaker board: instantiates `picosoc` (iCE40UP5K config, SPRAM, 7-seg; no PLL, raw 12 MHz). Current rv32im params: `BARREL_SHIFTER=0`, `ENABLE_MUL=0`, `ENABLE_DIV=1`, `ENABLE_FAST_MUL=1`, `ENABLE_COMPRESSED=0`, `ENABLE_ICACHE` (cache on/off). |
+| `picosoc/picosoc.v` | SoC wrapper. Wires CPU to SRAM, UART, SPI flash, GPIO. Address decode + memory map live here; the `icache` sits on this bus between the CPU and `spimemio`. |
+| `picosoc/icache.v` | Instruction cache (added): direct-mapped, 256-entry, 1-word/line, EBR-backed. Intercepts the flash-region fetch path. |
+| `README.md` | Full documentation of all configuration parameters. |
+| `picosoc/README.md` | picosoc documentation. |
+| `picosoc/benchmarks.c` | benchmark suite |
+| `picosoc/benchmarks.h` | benchmark suite header file. |
 
 Ideally also get it to read the [technical deep dive](guide/guide.tex)
 
 Tier 2 Files
 
-| File | Lines | Role |
-| --- | ---: | --- |
-| `picosoc/sections.lds` | — | Linker script: `.text`/`.rodata` → FLASH (`0x00100000`), `.data`/`.bss`/`.heap` → SPRAM — the memory map (code in flash = the fetch-bound reality). Preprocessed `-DICEBREAKER` → `icebreaker_sections.lds`. |
-| `picosoc/start.s` | — | Assembly startup: zero regs, zero SPRAM, copy `.data` from flash, zero `.bss`, call `main()`. Also `flashio_worker`. |
-| `picosoc/firmware.c` | — | Example firmware (HW–SW interaction); holds the `run_workload()`/`cmd_benchmark_cpi()` harness and flash-mode helpers. |
-| `picosoc/ice40up5k_spram.v` | 91 | SPRAM wrapper. 1-cycle data memory (why there's no D-cache). |
-| `picosoc/icebreaker.pcf` | — | Pin constraints: FPGA pins → LEDs, UART, flash, 7-seg. |
+| File | Role |
+| --- | --- |
+| `picosoc/sections.lds` | Linker script: `.text`/`.rodata` → FLASH (`0x00100000`), `.data`/`.bss`/`.heap` → SPRAM — the memory map (code in flash = the fetch-bound reality). Preprocessed `-DICEBREAKER` → `icebreaker_sections.lds`. |
+| `picosoc/start.s` | Assembly startup: zero regs, zero SPRAM, copy `.data` from flash, zero `.bss`, call `main()`. Also `flashio_worker`. |
+| `picosoc/firmware.c` | Example firmware (HW–SW interaction); holds the `run_workload()`/`run_scope()` harness and flash-mode helpers. |
+| `picosoc/ice40up5k_spram.v` | SPRAM wrapper. 1-cycle data memory (why there's no D-cache). |
+| `picosoc/icebreaker.pcf` | Pin constraints: FPGA pins → LEDs, UART, flash, 7-seg. |
 
 Tier 3 Files
 
-| File | Lines | Role |
-| --- | ---: | --- |
-| `picosoc/icebreaker_tb.v` | — | Testbench for simulation (cycle counts). |
-| `picosoc/spiflash.v` | — | Behavioural SPI flash model (W25Q-like): QSPI/CRM/DDR timing; used by `icebreaker_tb.v`. Needed to measure cache/fetch-latency changes in sim. |
-| `picosoc/Makefile` | — | Build flow: yosys → nextpnr → icepack → iceprog (area + fmax). Firmware compiled `-march=rv32im -mabi=ilp32`. |
-| `tests/*.S` | — | 45 RISC-V instruction unit tests (must still pass after edits). |
-| `picosoc/simpleuart.v` | 137 | UART. Console output only; not a PPA factor. |
+| File | Role |
+| --- | --- |
+| `picosoc/icebreaker_tb.v` | Testbench for simulation (cycle counts). |
+| `picosoc/spiflash.v` | Behavioural SPI flash model (W25Q-like): QSPI/CRM/DDR timing; used by `icebreaker_tb.v`. Needed to measure cache/fetch-latency changes in sim. |
+| `picosoc/Makefile` | Build flow: yosys → nextpnr → icepack → iceprog (area + fmax). Firmware compiled `-march=rv32im -mabi=ilp32`. |
+| `tests/*.S` | 45 RISC-V instruction unit tests (must still pass after edits). |
+| `picosoc/simpleuart.v` | UART. Console output only; not a PPA factor. |
 
-**Key configuration knobs** (parameters in `picorv32.v`): `ENABLE_REGS_16_31`, `ENABLE_REGS_DUALPORT`, `ENABLE_MUL`, `ENABLE_FAST_MUL`, `ENABLE_DIV`, `ENABLE_IRQ`, `ENABLE_COMPRESSED_ISA`, `BARREL_SHIFTER`, `TWO_STAGE_SHIFT`, `TWO_CYCLE_ALU`, `TWO_CYCLE_COMPARE`.
+**Key configuration knobs** (parameters in `picorv32.v`): `ENABLE_REGS_16_31`, `ENABLE_REGS_DUALPORT`, `ENABLE_MUL`, `ENABLE_FAST_MUL`, `ENABLE_DIV`, `ENABLE_IRQ`, `COMPRESSED_ISA`, `BARREL_SHIFTER`, `TWO_STAGE_SHIFT`, `TWO_CYCLE_ALU`, `TWO_CYCLE_COMPARE`. (PicoSoC wraps these under `ENABLE_COMPRESSED` etc., and adds its own `ENABLE_ICACHE` flag — see `picosoc.v`.)
 
 ## PicoRV32 Brief Background
 
@@ -98,13 +104,13 @@ We create our own to act as a proxy for an unknown range of benchmarks, covering
 
 ### Harness conventions
 
-Every benchmark — micro or program — follows the project template (`unsigned char run_workload(void)`, frozen `-march=rv32im`) and the same rules, so results are comparable and survive the optimiser:
+Every benchmark — micro or program — is a `uint8_t bench_NAME(void)` (frozen `-march=rv32im`) following the same rules, so results are comparable and survive the optimiser. The scored workload is selected by `run_workload()` in `firmware.c`, which calls one `bench_*`:
 
 - **Return a byte checksum folded from all the work**, so dead-code elimination can't delete the kernel.
 - **Fixed seeds / static SPRAM inputs** (`xorshift32` for any pseudo-random data) → deterministic `N`, cycle count, and a known-good checksum that doubles as a correctness regression test after each hardware edit.
-- **An outer `REPEAT` count** to scale the run into a clean Picoscope window *without changing the instruction mix*.
-- **Measurement**: reuse `cmd_benchmark_cpi()` to log `cycles` / `instrs` / `CPI` over UART (sim and board); read wall-clock from the LED1 period on the scope; cross-check against $T_{\text{exec}} = N \times \text{CPI} \times T_c$. `N` is fixed by the frozen source, so every delta is pure $\text{CPI} \times T_c$.
-- **Size every benchmark to a similar runtime** so the dashboard reads cleanly, and **record each kernel's code footprint** (`size` of `run_workload`) — it predicts cache behaviour.
+- **An inner loop count** (a literal in each kernel, e.g. `50000`) scales the run into a clean Picoscope window *without changing the instruction mix*.
+- **Measurement**: `time_benchmark()` logs `cycles` / `instrs` / `CPI` over UART (sim and board) — driven per-suite by `run_benchmarks()` and on the scored path by `run_scope()`, which toggles LED1; read wall-clock from the LED1 period on the scope and cross-check against $T_{\text{exec}} = N \times \text{CPI} \times T_c$. `N` is fixed by the frozen source, so every delta is pure $\text{CPI} \times T_c$.
+- **Size every benchmark to a similar runtime** so the dashboard reads cleanly. Each kernel's code footprint (`size` of its `bench_*`) predicts cache behaviour.
 
 ### Layer 1 — Core-operation microbenchmarks
 
@@ -112,34 +118,34 @@ Organised by the three sources of CPI (the fetch-stall vs core split above) — 
 
 | Bucket | Benchmark | Kernel |
 | --- | --- | --- |
-| **Compute** | `u_alu` | dependent `add`/`sub`/`and`/`or`/`xor`/`slt` chain |
-| | `u_shift` | variable-distance `sll`/`srl`/`sra` |
-| | `u_mul` | `mul`/`mulh` chain |
-| | `u_div` | `div`/`rem` stream |
-| | `u_branch` | data-dependent taken/not-taken branches |
-| | `u_call` | leaf-function call/return loop |
-| **Memory** | `u_memcpy` | streaming load+store over an SPRAM array |
-| | `u_chase` | pointer chase — dependent loads (load latency) |
-| **Fetch** | `u_hot` | tiny loop × many iterations (instruction reuse) |
-| | `u_cold` | large straight-line / unrolled body, footprint > cache |
+| **Compute** | `bench_alu` | dependent `add`/`sub`/`and`/`or`/`xor`/`slt` chain |
+| | `bench_shift` | variable-distance `sll`/`srl`/`sra` |
+| | `bench_mul` | `mul`/`mulhu` chain |
+| | `bench_div` | `div`/`rem` stream |
+| | `bench_branch` | data-dependent taken/not-taken branches |
+| | `bench_call` | leaf-function call/return loop |
+| **Memory** | `bench_memcpy` | streaming load+store over an SPRAM array |
+| | `bench_chase` | pointer chase — dependent loads (load latency) |
+| **Fetch** | `bench_hot` | tiny loop × many iterations (instruction reuse) |
+| | `bench_cold` | large straight-line / unrolled body, footprint > cache |
 
-The fetch pair matters most for this CPU: `u_hot` and `u_cold` run the same arithmetic at opposite footprints, so together they separate "hot code stayed hot" (cache) from "cold/large code got cheaper" (fast-read).
+The fetch pair matters most for this CPU: `bench_hot` and `bench_cold` run the same arithmetic at opposite footprints, so together they separate "hot code stayed hot" (cache) from "cold/large code got cheaper" (fast-read).
 
 ### Layer 2 — Application programs
 
-One representative kernel per archetype the other teams will plausibly submit. The **core 6** span the main mix axes; the rest extend breadth.
+One representative kernel per archetype the other teams will plausibly submit. The **core 6** (implemented in `benchmarks.c`) span the main mix axes; the rest are planned to extend breadth.
 
 | Archetype | Benchmark | Kernel | Character |
 | --- | --- | --- | --- |
-| Sorting | `bubble_sort` | sort N ints (the handout example) | branchy, data-dependent, ld/st |
-| Linear algebra | `matmul` | 16×16 integer matrix multiply | mul-accumulate, nested loops, streaming |
-| Hashing / integrity | `crc32` | CRC-32 over a byte buffer | shift + xor + logic, tight loop |
-| Number theory | `prime_count` | count primes ≤ N by trial division | div/mod + branch |
-| DSP / filtering | `fir_filter` | fixed-point N-tap FIR over a signal | mul-acc + shift + streaming loads |
-| Text | `strsearch` | naive substring search over text | byte loads + branches |
-| Simulation | `game_of_life` | Conway, K generations on a grid | 2-D stencil, branch, memory |
-| Recursion | `fib_rec` | recursive Fibonacci(n) | call/return + stack ld/st |
-| RNG / Monte-Carlo | `xorshift_mc` | PRNG → fixed-point π estimate | shift/xor + compare + mul |
+| Sorting | `bench_bubble_sort` | sort N ints (the handout example) | branchy, data-dependent, ld/st |
+| Linear algebra | `bench_matmul` | 16×16 integer matrix multiply | mul-accumulate, nested loops, streaming |
+| Hashing / integrity | `bench_crc32` | CRC-32 over a byte buffer | shift + xor + logic, tight loop |
+| Number theory | `bench_prime_count` | count primes ≤ N by trial division | div/mod + branch |
+| DSP / filtering | `bench_fir` | fixed-point 16-tap FIR over a signal | mul-acc + shift + streaming loads |
+| Text | `bench_strsearch` | naive substring search over text | byte loads + branches |
+| Simulation | `game_of_life` *(planned)* | Conway, K generations on a grid | 2-D stencil, branch, memory |
+| Recursion | `fib_rec` *(planned)* | recursive Fibonacci(n) | call/return + stack ld/st |
+| RNG / Monte-Carlo | `xorshift_mc` *(planned)* | PRNG → fixed-point π estimate | shift/xor + compare + mul |
 
 ### Results
 
@@ -156,17 +162,17 @@ Showing performance of all micro-ops and programs:
 ```text
 design: <branch>                 cycles    CPI    mix (top op classes)
 Compute
-  u_alu                             .        .
-  u_shift                           .        .
+  bench_alu                         .        .
+  bench_shift                       .        .
   ...
 Memory
-  u_memcpy                          .        .
+  bench_memcpy                      .        .
 Fetch
-  u_hot                             .        .
-  u_cold                            .        .
+  bench_hot                         .        .
+  bench_cold                        .        .
 Programs
-  bubble_sort                       .        .     branch / ld-st / alu
-  matmul                            .        .     mul / ld / alu
+  bench_bubble_sort                 .        .     branch / ld-st / alu
+  bench_matmul                      .        .     mul / ld / alu
   ...
 ```
 
@@ -177,6 +183,33 @@ $$
 $$
 
 geomean rather than arithmetic so one slow kernel can't swamp the figure — standard SPEC practice.
+
+Baseline figures:
+
+```txt
+benchmark (cycles  instrs  CPI  checksum)
+-- Compute --
+alu           125052910   1850038   67.59   82
+shift         115452462   1700031   67.91   0
+mul           137852910   2050038   67.24   124
+div           84682526   1240032   68.29   183
+branch        222790461   2974936   74.88   64
+call          290952270   4100028   70.96   32
+-- Memory --
+memcpy        66409751   930068   71.40   64
+chase         64565303   904386   71.39   136
+-- Fetch --
+hot           282602206   4000027   70.65   117
+cold          65925462   1029530   64.03   239
+-- Programs --
+bubble_sort   52748123   756032   69.76   77   branch/ld-st
+matmul        201222585   2922496   68.85   204   mul/ld-st
+crc32         223126030   3075453   72.55   0   shift/xor
+prime_count   45665871   521375   87.58   141   div/branch
+fir           301194379   4328124   69.59   214   mul/shift
+strsearch     127429678   1568299   81.25   200   ld/branch
+done
+```
 
 ## Design Choices
 
@@ -197,7 +230,7 @@ PLL optimizations can be applied for free.
 | `COMPRESSED_ISA=0` | $T_c$ | low | high | low | ✅ |
 | `TWO_CYCLE_ALU/COMPARE` + retiming | $T_c$ | low | cond. | low | ❌ |
 | Flash fast-read (Dual/Quad/DDR + CRM) | fetch | low | high | low–med | ❌ |
-| Instruction cache (EBR) | fetch | med | high | med | ❌ |
+| Instruction cache (EBR) | fetch | med | high | med | ✅ |
 | Loop buffer | fetch | low–med | med | low | ❌ |
 | `BARREL_SHIFTER=1` | core CPI | low | med | low | ❌ |
 | Fast-path load/store; SRT divider | core CPI | med | med | low–med | ❌ |
@@ -217,11 +250,36 @@ The example firmware's `boot()` sets the *flash chip's* QE bit but never switche
 
 ### Instruction cache
 
-Loops re-fetch the same instructions every iteration; an EBR-backed cache serves repeats in **1 cycle**, and the `while(1)` structure means a ~100% hit rate after the first iteration. (Complementary to fast-read, which only shrinks the cold-miss penalty.) Running code directly from SPRAM is *not* an option — the linker script pins `.text` to flash, SPRAM is fully allocated to data, and SPRAM isn't pre-loadable — so "execute from SPRAM" collapses to exactly this bus-resident cache.
+Loops re-fetch the same instructions every iteration; an EBR-backed cache serves repeats in a fixed **2 cycles** (vs the tens of cycles a flash fetch costs), and the `while(1)` structure means a ~100% hit rate after the first iteration. (Complementary to fast-read, which only shrinks the cold-miss penalty.) Running code directly from SPRAM is *not* an option — the linker script pins `.text` to flash, SPRAM is fully allocated to data, and SPRAM isn't pre-loadable — so "execute from SPRAM" collapses to exactly this bus-resident cache.
 
-It sits between the CPU memory interface and `spimemio`: on a hit it returns the word and asserts `mem_ready` immediately (intercepting the memory bus FSM at its idle state); on a miss it forwards to flash, caches the returned word, then responds. `mem_instr` keeps it instruction-only (no D-cache needed — SPRAM is already 1-cycle).
+It sits on the PicoSoC bus alongside `spimemio`, selected by the flash **address range** (`4*MEM_WORDS ≤ addr < 0x02000000`) in `picosoc.v` — so it only ever sees instruction fetches, since the flash region holds only `.text` (no D-cache needed — SPRAM is already 1-cycle; `mem_instr` is not consulted). On a hit it returns the cached word and asserts `cpu_ready` (→ `mem_ready`) two cycles after the request; on a miss it forwards to flash, caches the returned word, then responds. It is gated by the `ENABLE_ICACHE` parameter (default 1; set 0 to wire the CPU straight to `spimemio` — the pre-cache fetch path).
 
-**Proposed:** a direct-mapped, 256-entry, 1-word-per-block cache (1 KB) using ~2 EBR for data, with the address split as `tag[31:10]` / `set[9:2]` / `byte[1:0]`. The tag array holds 256 × (1 valid + 22 tag) bits (a small LUT-RAM or one EBR). Scaling knobs if needed: larger capacity (e.g. 4 KB / ~8 EBR) cuts capacity misses; 2-way cuts conflict misses where two hot addresses alias; multi-word blocks add spatial locality at a higher miss penalty. Instruction caches are read-only, so no write policy is needed.
+**Implemented** (`icache.v`): a direct-mapped, 256-entry, 1-word-per-block cache (1 KB) using ~2 EBR for data, with the address split as `tag[31:10]` / `set[9:2]` / `byte[1:0]`. The tag array holds 256 × (1 valid + 14 tag) bits in one EBR; a post-reset sweep clears the valid bits before the first lookup (EBR powers up undefined). A 3-state FSM (idle → check → fill) reads the tag/data EBR, compares, and on a miss forwards to `spimemio` then caches the returned word. Scaling knobs if needed: larger capacity (e.g. 4 KB / ~8 EBR) cuts capacity misses; 2-way cuts conflict misses where two hot addresses alias; multi-word blocks add spatial locality at a higher miss penalty. Instruction caches are read-only, so no write policy is needed.
+
+```txt
+benchmark (cycles  instrs  CPI  checksum)
+-- Compute --
+alu           12754952   1850038   6.89   82
+shift         11816780   1700031   6.95   0
+mul           12705209   2050038   6.19   124
+div           11364096   1240032   9.16   183
+branch        21069356   2974936   7.08   64
+call          27604492   4100028   6.73   32
+-- Memory --
+memcpy        6204728   930068   6.67   64
+chase         6132492   904386   6.78   136
+-- Fetch --
+hot           26803281   4000027   6.70   117
+cold          65926971   1029530   64.03   239
+-- Programs --
+bubble_sort   4840578   756032   6.40   77   branch/ld-st
+matmul        18850448   2922496   6.45   204   mul/ld-st
+crc32         19712046   3075453   6.40   0   shift/xor
+prime_count   5231708   521375   10.03   141   div/branch
+fir           27808623   4328124   6.42   214   mul/shift
+strsearch     10523128   1568299   6.70   200   ld/branch
+done
+```
 
 A **loop buffer** (loop-stream detector, no tag array) is a cheaper fallback if LCs get tight — same ~100% hit rate for tight loops, but no help for straight-line or nested code.
 

@@ -38,13 +38,27 @@ module icache (
 	reg [14:0] tag_q; // _q: registered EBR read-out of tag_mem  (valid in cache_state_check)
 	reg [31:0] data_q; // _q: registered EBR read-out of data_mem
 
+	// EBR powers up undefined on silicon, so the valid bits must be cleared explicitly after reset before any lookup.
+	// (In sim, uninitialised tag_mem reads X and the hit-compare is accidentally false -- silicon has no luck.)
+	reg        init_done;  // invalidation sweep finished?
+	reg [7:0]  init_idx;   // sweep counter, walks all 256 lines
+
 	always @(posedge clk) begin
 		cpu_ready <= 0;
 		spi_valid <= 0;
 
+		if (!init_done) begin
+			// invalidate every line (clear valid bit 14) before serving requests
+			tag_mem[init_idx] <= 0;
+			init_idx <= init_idx + 1;
+			if (&init_idx) init_done <= 1;   // last line cleared
+		end else
+		
 		case (cache_state)
 			cache_state_idle: begin
-				if (cpu_valid) begin
+				// !cpu_ready: don't re-accept the request we're acking this cycle
+				// cpu_valid lingers high during the ack, which would otherwise trigger a phantom hit that corrupts the next request.
+				if (cpu_valid && !cpu_ready) begin
 					req_idx <= cpu_addr[9:2];
 					req_tag <= cpu_addr[23:10];
 					tag_q   <= tag_mem[cpu_addr[9:2]];
@@ -85,6 +99,8 @@ module icache (
 			cache_state <= cache_state_idle;
 			cpu_ready   <= 0;
 			spi_valid   <= 0;
+			init_done   <= 0;
+			init_idx    <= 0;
 		end
 	end
 endmodule

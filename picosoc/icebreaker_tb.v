@@ -30,7 +30,7 @@ module testbench;
 		$dumpfile("testbench.vcd");
 		$dumpvars(0, testbench);
 
-		repeat (6) begin
+		repeat ($test$plusargs("stim") ? 120 : 6) begin
 			repeat (50000) @(posedge clk);
 			$display("+50000 cycles");
 		end
@@ -43,12 +43,28 @@ module testbench;
 		cycle_cnt <= cycle_cnt + 1;
 	end
 
+	// Trap detector + bus trace. A CPU trap (illegal instr / misalign) is the
+	// firmware dying; without this it just looks like a silent UART freeze.
+	// The trap line is always on; the per-transfer trace is opt-in: vvp ... +trace
+	reg trace_en;
+	reg trap_seen = 0;
+	initial trace_en = $test$plusargs("trace");
+	always @(posedge clk) begin
+		if (trace_en && uut.soc.mem_valid && uut.soc.mem_ready)
+			$display("XFER c=%0d addr=%h instr=%b rdata=%h", cycle_cnt,
+				uut.soc.mem_addr, uut.soc.mem_instr, uut.soc.mem_rdata);
+		if (uut.soc.cpu.trap && !trap_seen) begin
+			trap_seen <= 1;
+			$display("*** CPU TRAP at pc=%h (cycle %0d) ***", uut.soc.cpu.reg_pc, cycle_cnt);
+		end
+	end
+
 	wire led1, led2, led3, led4, led5;
 	wire ledr_n, ledg_n;
 
 	wire [6:0] leds = {!ledg_n, !ledr_n, led5, led4, led3, led2, led1};
 
-	wire ser_rx;
+	reg  ser_rx = 1'b1;   // driven by the +stim uart_send task below
 	wire ser_tx;
 
 	wire flash_csb;
@@ -63,10 +79,10 @@ module testbench;
 	end
 
 	icebreaker #(
-		// We limit the amount of memory in simulation
-		// in order to avoid reduce simulation time
-		// required for intialization of RAM
-		.MEM_WORDS(256)
+		// 8192 words = 32 KB: fits the firmware's ~10 KB .bss (benchmark arrays)
+		// + stack. The old 256 (1 KB) only covered the boot path -- any workload
+		// touching the big arrays mapped outside SPRAM into the flash/cache range.
+		.MEM_WORDS(8192)
 	) uut (
 		.clk      (clk      ),
 		.led1     (led1     ),
@@ -118,5 +134,31 @@ module testbench;
 			$display("Serial data: %d", buffer);
 		else
 			$display("Serial data: '%c'", buffer);
+	end
+
+	// RX stimulus (opt-in: vvp ... +stim). Drives ser_rx to exercise the
+	// post-"Press ENTER" path -- banner, menu, commands -- which has no sim
+	// coverage otherwise (the firmware blocks forever on getchar()).
+	task uart_send(input [7:0] b);
+		integer i;
+		begin
+			ser_rx = 0; repeat (105) @(posedge clk);          // start bit
+			for (i = 0; i < 8; i = i + 1) begin
+				ser_rx = b[i]; repeat (105) @(posedge clk);    // data bits, LSB first
+			end
+			ser_rx = 1; repeat (105) @(posedge clk);          // stop bit
+		end
+	endtask
+
+	initial begin
+		ser_rx = 1;
+		if ($test$plusargs("stim")) begin
+			repeat (400000) @(posedge clk);
+			$display(">>> stim: ENTER");  uart_send(8'h0D);
+			repeat (300000) @(posedge clk);
+			$display(">>> stim: 'B' (run scope -> matmul workload)");
+			uart_send("B");
+			// run_scope loops forever; the trap detector catches any death
+		end
 	end
 endmodule

@@ -19,6 +19,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "benchmarks.h"
 
 #ifdef ICEBREAKER
 #  define MEM_TOTAL 0x20000 /* 128 KB */
@@ -40,6 +41,21 @@ extern uint32_t sram;
 #define reg_leds (*(volatile uint32_t*)0x03000000)
 #define reg_7seg (*(volatile uint8_t*)0x03000001)
 
+/* =====================================================================
+ * ENGINEERING LOG — I-cache freeze
+ * ---------------------------------------------------------------------
+ * Symptom: with the I-cache added, the board froze intermittently when a key was pressed during the all-LEDs-on (FF) phase; the 00 phase was fine.
+ *
+ * Root cause: the cache immortalises a *transient* flash-read error. Without a cache a bad word self-heals (re-fetched next loop)
+ * cached, it's stored with a valid tag and replayed forever -> CPU runs a corrupt instr and hangs.
+ *
+ * Trigger: simultaneous output switching. The keypress write reg_leds=0 flipped all ~15 driven pins 0xFF->0x00 at once (large current change) just before a flash fetch, corrupting the sampled word.
+ * A powered USB hub did NOT help -> it's on-chip switching noise / ground bounce, not supply margin.
+ * Pressing during the 00 phase is a no-op write -> no glitch.
+ *
+ * Fix (symptom-level): boot() and getchar_prompt() drive ONE LED at a time, never the all-on word.
+ * ===================================================================== */
+
 // --------------------------------------------------------
 
 extern uint32_t flashio_worker_begin;
@@ -58,62 +74,9 @@ void flashio(uint8_t *data, int len, uint8_t wrencmd)
 	((void(*)(uint8_t*, uint32_t, uint32_t))func)(data, len, wrencmd);
 }
 
-#ifdef HX8KDEMO
-void set_flash_qspi_flag()
-{
-	uint8_t buffer[8];
-	uint32_t addr_cr1v = 0x800002;
 
-	// Read Any Register (RDAR 65h)
-	buffer[0] = 0x65;
-	buffer[1] = addr_cr1v >> 16;
-	buffer[2] = addr_cr1v >> 8;
-	buffer[3] = addr_cr1v;
-	buffer[4] = 0; // dummy
-	buffer[5] = 0; // rdata
-	flashio(buffer, 6, 0);
-	uint8_t cr1v = buffer[5];
-
-	// Write Enable (WREN 06h) + Write Any Register (WRAR 71h)
-	buffer[0] = 0x71;
-	buffer[1] = addr_cr1v >> 16;
-	buffer[2] = addr_cr1v >> 8;
-	buffer[3] = addr_cr1v;
-	buffer[4] = cr1v | 2; // Enable QSPI
-	flashio(buffer, 5, 0x06);
-}
-
-void set_flash_latency(uint8_t value)
-{
-	reg_spictrl = (reg_spictrl & ~0x007f0000) | ((value & 15) << 16);
-
-	uint32_t addr = 0x800004;
-	uint8_t buffer_wr[5] = {0x71, addr >> 16, addr >> 8, addr, 0x70 | value};
-	flashio(buffer_wr, 5, 0x06);
-}
-
-void set_flash_mode_spi()
-{
-	reg_spictrl = (reg_spictrl & ~0x00700000) | 0x00000000;
-}
-
-void set_flash_mode_dual()
-{
-	reg_spictrl = (reg_spictrl & ~0x00700000) | 0x00400000;
-}
-
-void set_flash_mode_quad()
-{
-	reg_spictrl = (reg_spictrl & ~0x00700000) | 0x00200000;
-}
-
-void set_flash_mode_qddr()
-{
-	reg_spictrl = (reg_spictrl & ~0x00700000) | 0x00600000;
-}
-#endif
-
-#ifdef ICEBREAKER
+// Flash read-mode setters (write reg_spictrl); used by run_flashmodes() for
+// measurement, not on the scored path.
 void set_flash_qspi_flag()
 {
 	uint8_t buffer[8];
@@ -154,7 +117,6 @@ void enable_flash_crm()
 {
 	reg_spictrl |= 0x00100000;
 }
-#endif
 
 // --------------------------------------------------------
 
@@ -200,7 +162,8 @@ char getchar_prompt(char *prompt)
 	uint32_t cycles_begin, cycles_now, cycles;
 	__asm__ volatile ("rdcycle %0" : "=r"(cycles_begin));
 
-	reg_leds = ~0;
+	// Heartbeat on LED1 only (0x02), never the all-on word (~0). Driving all 7 LEDs + 7-seg caused a simultaneous-switching transient on keypress that the I-cache turned into a permanent freeze.
+	reg_leds = 0x02;
 
 	if (prompt)
 		print(prompt);
@@ -212,7 +175,7 @@ char getchar_prompt(char *prompt)
 			if (prompt)
 				print(prompt);
 			cycles_begin = cycles_now;
-			reg_leds = ~reg_leds;
+			reg_leds = reg_leds ^ 0x02;   // toggle LED1 only
 		}
 		c = reg_uart_data;
 	}
@@ -331,38 +294,6 @@ void cmd_read_flash_id()
 
 // --------------------------------------------------------
 
-#ifdef HX8KDEMO
-uint8_t cmd_read_flash_regs_print(uint32_t addr, const char *name)
-{
-	set_flash_latency(8);
-
-	uint8_t buffer[6] = {0x65, addr >> 16, addr >> 8, addr, 0, 0};
-	flashio(buffer, 6, 0);
-
-	print("0x");
-	print_hex(addr, 6);
-	print(" ");
-	print(name);
-	print(" 0x");
-	print_hex(buffer[5], 2);
-	print("\n");
-
-	return buffer[5];
-}
-
-void cmd_read_flash_regs()
-{
-	print("\n");
-	uint8_t sr1v = cmd_read_flash_regs_print(0x800000, "SR1V");
-	uint8_t sr2v = cmd_read_flash_regs_print(0x800001, "SR2V");
-	uint8_t cr1v = cmd_read_flash_regs_print(0x800002, "CR1V");
-	uint8_t cr2v = cmd_read_flash_regs_print(0x800003, "CR2V");
-	uint8_t cr3v = cmd_read_flash_regs_print(0x800004, "CR3V");
-	uint8_t vdlp = cmd_read_flash_regs_print(0x800005, "VDLP");
-}
-#endif
-
-#ifdef ICEBREAKER
 uint8_t cmd_read_flash_reg(uint8_t cmd)
 {
 	uint8_t buffer[2] = {cmd, 0};
@@ -421,286 +352,66 @@ void cmd_read_flash_regs()
 	print_reg_bit(sr3 & 0x80, "S23 (HOLD)");
 	putchar('\n');
 }
-#endif
 
 // --------------------------------------------------------
 
-// Original PicoSoC benchmark. Runs a fixed workload, prints results in hex.
-// Used by cmd_benchmark_all() to compare flash modes (returns cycle count).
-uint32_t cmd_benchmark(bool verbose, uint32_t *instns_p)
-{
-	uint8_t data[256];
-	uint32_t *words = (void*)data;
-
-	uint32_t x32 = 314159265;
-
-	uint32_t cycles_begin, cycles_end;
-	uint32_t instns_begin, instns_end;
-	__asm__ volatile ("rdcycle %0" : "=r"(cycles_begin));
-	__asm__ volatile ("rdinstret %0" : "=r"(instns_begin));
-
-	for (int i = 0; i < 20; i++)
-	{
-		for (int k = 0; k < 256; k++)
-		{
-			x32 ^= x32 << 13;
-			x32 ^= x32 >> 17;
-			x32 ^= x32 << 5;
-			data[k] = x32;
-		}
-
-		for (int k = 0, p = 0; k < 256; k++)
-		{
-			if (data[k])
-				data[p++] = k;
-		}
-
-		for (int k = 0, p = 0; k < 64; k++)
-		{
-			x32 = x32 ^ words[k];
-		}
-	}
-
-	__asm__ volatile ("rdcycle %0" : "=r"(cycles_end));
-	__asm__ volatile ("rdinstret %0" : "=r"(instns_end));
-
-	if (verbose)
-	{
-		print("Cycles: 0x");
-		print_hex(cycles_end - cycles_begin, 8);
-		putchar('\n');
-
-		print("Instns: 0x");
-		print_hex(instns_end - instns_begin, 8);
-		putchar('\n');
-
-		print("Chksum: 0x");
-		print_hex(x32, 8);
-		putchar('\n');
-	}
-
-	if (instns_p)
-		*instns_p = instns_end - instns_begin;
-
-	return cycles_end - cycles_begin;
-}
-
-// TODO: Workload function matching the project benchmark template.
-// Replace the body with your actual workload; return value is
-// displayed on the 7-segment display.
+// The scored workload: the ONE benchmark wired to the LED1 scope loop
+// (run_scope). Change this single line to pick which benchmark is scored.
 unsigned char run_workload(void)
 {
-	uint8_t data[256];
-	uint32_t x32 = 314159265;
-
-	for (int k = 0; k < 256; k++) {
-		x32 ^= x32 << 13;
-		x32 ^= x32 >> 17;
-		x32 ^= x32 << 5;
-		data[k] = x32;
-	}
-
-	for (int k = 0, p = 0; k < 256; k++) {
-		if (data[k])
-			data[p++] = k;
-	}
-
-	return (unsigned char)x32;
+	return bench_matmul();
 }
 
-// GB3 Project CPI benchmark. Runs run_workload() in an infinite loop:
-//  - Measures cycles and instructions via rdcycle/rdinstret CSRs
-//  - Prints cycles, instructions, CPI (2 decimal places) over UART
-//  - Toggles LED1 each iteration for Picoscope timing measurement
-//  - Writes return value to 7-seg (prevents compiler optimizing away the call)
-void cmd_benchmark_cpi()
+// Scope run: loop the workload forever, timing each pass and toggling LED1 for the Picoscope.
+// Prints cycles / instrs / CPI over UART. Stops on a key.
+void run_scope(void)
 {
-	uint32_t cycles_begin, cycles_end;
-	uint32_t instns_begin, instns_end;
 	uint8_t leds_val = 0x02;
-
-	print("Running CPI benchmark (press any key to stop)...\n");
+	print("Scope run: workload on LED1 (press any key to stop)...\n");
 
 	while (1) {
 		if ((int32_t)reg_uart_data != -1) return;
-		__asm__ volatile ("rdcycle %0" : "=r"(cycles_begin));
-		__asm__ volatile ("rdinstret %0" : "=r"(instns_begin));
 
-		reg_7seg = run_workload();
-
-		__asm__ volatile ("rdcycle %0" : "=r"(cycles_end));
-		__asm__ volatile ("rdinstret %0" : "=r"(instns_end));
+		uint32_t ins;
+		uint32_t cyc = time_benchmark(run_workload, &ins, 0);
 
 		reg_leds = leds_val;
 		leds_val ^= 0x02;
-
-		uint32_t cyc = cycles_end - cycles_begin;
-		uint32_t ins = instns_end - instns_begin;
 
 		print("cycles=");
 		print_dec(cyc);
 		print(" instrs=");
 		print_dec(ins);
 
-		// CPI with 2 decimal places via integer math: cyc*100/ins
-		if (ins > 0) {
-			uint32_t cpi100 = cyc * 100 / ins;
-			print(" CPI=");
-			print_dec(cpi100 / 100);
-			putchar('.');
-			uint32_t frac = cpi100 % 100;
-			if (frac < 10) putchar('0');
-			print_dec(frac);
-		}
+		print(" CPI=");
+		print_cpi(cyc, ins);
 		print("\n");
 	}
 }
 
 // --------------------------------------------------------
 
-#ifdef HX8KDEMO
-void cmd_benchmark_all()
+void run_flashmodes(void)
 {
-	uint32_t instns = 0;
-
-	print("default        ");
-	reg_spictrl = (reg_spictrl & ~0x00700000) | 0x00000000;
-	print(": ");
-	print_hex(cmd_benchmark(false, &instns), 8);
-	putchar('\n');
-
-	for (int i = 8; i > 0; i--)
-	{
-		print("dspi-");
-		print_dec(i);
-		print("         ");
-
-		set_flash_latency(i);
-		reg_spictrl = (reg_spictrl & ~0x00700000) | 0x00400000;
-
-		print(": ");
-		print_hex(cmd_benchmark(false, &instns), 8);
-		putchar('\n');
+	static const struct { const char *name; void (*set)(void); } modes[] = {
+		{ "spi ", set_flash_mode_spi  },
+		{ "dual", set_flash_mode_dual },
+		{ "quad", set_flash_mode_quad },
+		{ "qddr", set_flash_mode_qddr },
+	};
+	print("\nflash-mode sweep (bench_cold)   cycles   instrs\n");
+	for (int m = 0; m < 4; m++) {
+		modes[m].set();
+		uint32_t ins;
+		uint32_t cyc = time_benchmark(bench_cold, &ins, 0);
+		print("  "); print(modes[m].name); print("  ");
+		print_dec(cyc); print("  "); print_dec(ins); print("\n");
 	}
-
-	for (int i = 8; i > 0; i--)
-	{
-		print("dspi-crm-");
-		print_dec(i);
-		print("     ");
-
-		set_flash_latency(i);
-		reg_spictrl = (reg_spictrl & ~0x00700000) | 0x00500000;
-
-		print(": ");
-		print_hex(cmd_benchmark(false, &instns), 8);
-		putchar('\n');
-	}
-
-	for (int i = 8; i > 0; i--)
-	{
-		print("qspi-");
-		print_dec(i);
-		print("         ");
-
-		set_flash_latency(i);
-		reg_spictrl = (reg_spictrl & ~0x00700000) | 0x00200000;
-
-		print(": ");
-		print_hex(cmd_benchmark(false, &instns), 8);
-		putchar('\n');
-	}
-
-	for (int i = 8; i > 0; i--)
-	{
-		print("qspi-crm-");
-		print_dec(i);
-		print("     ");
-
-		set_flash_latency(i);
-		reg_spictrl = (reg_spictrl & ~0x00700000) | 0x00300000;
-
-		print(": ");
-		print_hex(cmd_benchmark(false, &instns), 8);
-		putchar('\n');
-	}
-
-	for (int i = 8; i > 0; i--)
-	{
-		print("qspi-ddr-");
-		print_dec(i);
-		print("     ");
-
-		set_flash_latency(i);
-		reg_spictrl = (reg_spictrl & ~0x00700000) | 0x00600000;
-
-		print(": ");
-		print_hex(cmd_benchmark(false, &instns), 8);
-		putchar('\n');
-	}
-
-	for (int i = 8; i > 0; i--)
-	{
-		print("qspi-ddr-crm-");
-		print_dec(i);
-		print(" ");
-
-		set_flash_latency(i);
-		reg_spictrl = (reg_spictrl & ~0x00700000) | 0x00700000;
-
-		print(": ");
-		print_hex(cmd_benchmark(false, &instns), 8);
-		putchar('\n');
-	}
-
-	print("instns         : ");
-	print_hex(instns, 8);
-	putchar('\n');
+	set_flash_mode_spi();   // restore single-SPI baseline
+	print("done\n");
 }
-#endif
 
-#ifdef ICEBREAKER
-void cmd_benchmark_all()
-{
-	uint32_t instns = 0;
-
-	print("default   ");
-	set_flash_mode_spi();
-	print_hex(cmd_benchmark(false, &instns), 8);
-	putchar('\n');
-
-	print("dual      ");
-	set_flash_mode_dual();
-	print_hex(cmd_benchmark(false, &instns), 8);
-	putchar('\n');
-
-	// print("dual-crm  ");
-	// enable_flash_crm();
-	// print_hex(cmd_benchmark(false, &instns), 8);
-	// putchar('\n');
-
-	print("quad      ");
-	set_flash_mode_quad();
-	print_hex(cmd_benchmark(false, &instns), 8);
-	putchar('\n');
-
-	print("quad-crm  ");
-	enable_flash_crm();
-	print_hex(cmd_benchmark(false, &instns), 8);
-	putchar('\n');
-
-	print("qddr      ");
-	set_flash_mode_qddr();
-	print_hex(cmd_benchmark(false, &instns), 8);
-	putchar('\n');
-
-	print("qddr-crm  ");
-	enable_flash_crm();
-	print_hex(cmd_benchmark(false, &instns), 8);
-	putchar('\n');
-
-}
-#endif
+// --------------------------------------------------------
 
 void cmd_echo()
 {
@@ -717,14 +428,15 @@ void cmd_echo()
 // LEDs show progress (1 -> 3 -> 7) matching start.s convention.
 void boot()
 {
-	reg_leds = 31;
-	reg_uart_clkdiv = 104;  // 12 MHz / 115200 baud
+	// Low-current boot progress: ONE LED per step (led1 -> led2 -> led3), never the all-on word.
+	reg_leds = 0x02;            // led1
+	reg_uart_clkdiv = 104;      // 12 MHz / 115200 baud
 	reg_7seg = 0x00;
 
-	reg_leds = 63;
+	reg_leds = 0x04;            // led2
 	set_flash_qspi_flag();
 
-	reg_leds = 127;
+	reg_leds = 0x08;            // led3
 }
 
 void main()
@@ -761,16 +473,11 @@ void main()
 		print("\n");
 		print("   [1] Read SPI Flash ID\n");
 		print("   [2] Read SPI Config Regs\n");
-		print("   [3] Switch to default mode\n");
-		print("   [4] Switch to Dual I/O mode\n");
-		print("   [5] Switch to Quad I/O mode\n");
-		print("   [6] Switch to Quad DDR mode\n");
-		print("   [7] Toggle continuous read mode\n");
-		print("   [9] Run simplistic benchmark\n");
-		print("   [0] Benchmark all configs\n");
 		print("   [M] Run Memtest\n");
 		print("   [S] Print SPI state\n");
-		print("   [B] CPI benchmark \n");
+		print("   [B] Run scope (workload)\n");
+		print("   [T] Run benchmark suite\n");
+		print("   [F] Flash-mode sweep\n");
 		print("   [e] Echo UART\n");
 		print("\n");
 
@@ -790,27 +497,6 @@ void main()
 			case '2':
 				cmd_read_flash_regs();
 				break;
-			case '3':
-				set_flash_mode_spi();
-				break;
-			case '4':
-				set_flash_mode_dual();
-				break;
-			case '5':
-				set_flash_mode_quad();
-				break;
-			case '6':
-				set_flash_mode_qddr();
-				break;
-			case '7':
-				reg_spictrl = reg_spictrl ^ 0x00100000;
-				break;
-			case '9':
-				cmd_benchmark(true, 0);
-				break;
-			case '0':
-				cmd_benchmark_all();
-				break;
 			case 'M':
 				cmd_memtest();
 				break;
@@ -818,8 +504,14 @@ void main()
 				cmd_print_spi_state();
 				break;
 			case 'B':
-				cmd_benchmark_cpi();
-				break;  // never reached (loops forever)
+				run_scope();
+				break;
+			case 'T':
+				run_benchmarks();
+				break;
+			case 'F':
+				run_flashmodes();
+				break;
 			case 'e':
 				cmd_echo();
 				break;

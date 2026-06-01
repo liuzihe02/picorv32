@@ -31,15 +31,16 @@ uint32_t time_benchmark(bench_fn fn, uint32_t *instrs, uint8_t *chk)
 }
 
 // Print CPI (cycles/instr) to 2 decimals via integer math, e.g. "4.27".
-// No float/libgcc: scale by 100 then split. Caller must keep cyc < ~43M so
-// cyc*100 fits in uint32. Used by run_benchmarks() and run_scope().
+// No float/libgcc (no 64-bit divide), so divide first then scale the remainder:
+// the whole part is cyc/ins, and frac = (cyc%ins)*100/ins. Since cyc%ins < ins,
+// (cyc%ins)*100 can't overflow uint32 for any realistic ins -- unlike cyc*100,
+// which wrapped once cyc exceeded ~43M (the fetch-bound baseline runs are >50M).
 void print_cpi(uint32_t cyc, uint32_t ins)
 {
 	if (!ins) { print("--"); return; }
-	uint32_t cpi100 = (cyc * 100u) / ins;
-	print_dec(cpi100 / 100);
+	print_dec(cyc / ins);
 	putchar('.');
-	uint32_t frac = cpi100 % 100;
+	uint32_t frac = ((cyc % ins) * 100u) / ins;
 	if (frac < 10) putchar('0');
 	print_dec(frac);
 }

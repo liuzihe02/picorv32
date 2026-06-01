@@ -103,13 +103,13 @@ module picosoc (
 	wire [3:0] mem_wstrb;
 	wire [31:0] mem_rdata;
 
-	wire spimem_ready;
+	wire        spimem_valid;
+	wire [23:0] spimem_addr;
+	wire        spimem_ready;
 	wire [31:0] spimem_rdata;
 
-	wire cache_ready;
+	wire        cache_ready;
 	wire [31:0] cache_rdata;
-	wire spi_req_valid;
-	wire [23:0] spi_req_addr;
 
 	reg ram_ready;
 	wire [31:0] ram_rdata;
@@ -168,8 +168,8 @@ module picosoc (
 		.cpu_addr (mem_addr[23:0]),
 		.cpu_ready(cache_ready),
 		.cpu_rdata(cache_rdata),
-		.spi_valid(spi_req_valid),
-		.spi_addr (spi_req_addr),
+		.spi_valid(spimem_valid),
+		.spi_addr (spimem_addr),
 		.spi_ready(spimem_ready),
 		.spi_rdata(spimem_rdata)
 	);
@@ -177,9 +177,9 @@ module picosoc (
 	spimemio spimemio (
 		.clk    (clk),
 		.resetn (resetn),
-		.valid  (spi_req_valid),
+		.valid  (spimem_valid),
 		.ready  (spimem_ready),
-		.addr   (spi_req_addr),
+		.addr   (spimem_addr),
 		.rdata  (spimem_rdata),
 
 		.flash_csb    (flash_csb   ),

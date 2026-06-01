@@ -18,49 +18,56 @@ module icache (
 	// Yosys infers these as SB_RAM40_4K EBR blocks on iCE40:
 	//   data_mem: 256x32 = 2 EBR blocks
 	//   tag_mem:  256x15 = 1 EBR block  (bit 14 = valid, bits 13:0 = tag)
+	/*	addr broken down into
+	*	23                 10 9        2 1   0
+	*	+--------------------+----------+-----+
+	*	|   tag (14 bits)    | index(8) | 00  |
+	*	+--------------------+----------+-----+
+	*	req_tag               req_idx     byte
+	*/
 	reg [31:0] data_mem [0:255];
 	reg [14:0] tag_mem  [0:255];
 
-	localparam ST_IDLE  = 2'd0;
-	localparam ST_CHECK = 2'd1;  // waiting one cycle for EBR read output
-	localparam ST_FILL  = 2'd2;  // waiting for spimemio
+	localparam cache_state_idle  = 2'd0;  // accept request, issue EBR tag/data read
+	localparam cache_state_check = 2'd1;  // EBR read-out ready: compare tag -> hit/miss
+	localparam cache_state_fill  = 2'd2;  // miss: fetch the word from flash via spimemio
 
-	reg [1:0]  state;
+	reg [1:0]  cache_state;
 	reg [7:0]  req_idx;   // cpu_addr[9:2]
 	reg [13:0] req_tag;   // cpu_addr[23:10]
-	reg [14:0] rd_tag;
-	reg [31:0] rd_data;
+	reg [14:0] tag_q; // _q: registered EBR read-out of tag_mem  (valid in cache_state_check)
+	reg [31:0] data_q; // _q: registered EBR read-out of data_mem
 
 	always @(posedge clk) begin
 		cpu_ready <= 0;
 		spi_valid <= 0;
 
-		case (state)
-			ST_IDLE: begin
+		case (cache_state)
+			cache_state_idle: begin
 				if (cpu_valid) begin
 					req_idx <= cpu_addr[9:2];
 					req_tag <= cpu_addr[23:10];
-					rd_tag  <= tag_mem[cpu_addr[9:2]];
-					rd_data <= data_mem[cpu_addr[9:2]];
-					state   <= ST_CHECK;
+					tag_q   <= tag_mem[cpu_addr[9:2]];
+					data_q  <= data_mem[cpu_addr[9:2]];
+					cache_state <= cache_state_check;
 				end
 			end
 
-			ST_CHECK: begin
-				if (rd_tag == {1'b1, req_tag}) begin
+			cache_state_check: begin
+				if (tag_q == {1'b1, req_tag}) begin
 					// Hit: return cached word
-					cpu_rdata <= rd_data;
-					cpu_ready <= 1;
-					state     <= ST_IDLE;
+					cpu_rdata   <= data_q;
+					cpu_ready   <= 1;
+					cache_state <= cache_state_idle;
 				end else begin
 					// Miss: request from SPI flash
-					spi_valid <= 1;
-					spi_addr  <= {req_tag, req_idx, 2'b00};
-					state     <= ST_FILL;
+					spi_valid   <= 1;
+					spi_addr    <= {req_tag, req_idx, 2'b00};
+					cache_state <= cache_state_fill;
 				end
 			end
 
-			ST_FILL: begin
+			cache_state_fill: begin
 				spi_valid <= 1;
 				spi_addr  <= {req_tag, req_idx, 2'b00};
 				if (spi_ready) begin
@@ -69,15 +76,15 @@ module icache (
 					cpu_rdata         <= spi_rdata;
 					cpu_ready         <= 1;
 					spi_valid         <= 0;
-					state             <= ST_IDLE;
+					cache_state       <= cache_state_idle;
 				end
 			end
 		endcase
 
 		if (!resetn) begin
-			state     <= ST_IDLE;
-			cpu_ready <= 0;
-			spi_valid <= 0;
+			cache_state <= cache_state_idle;
+			cpu_ready   <= 0;
+			spi_valid   <= 0;
 		end
 	end
 endmodule

@@ -24,7 +24,7 @@
 `define PICOSOC_MEM ice40up5k_spram
 
 module icebreaker (
-	input clk,
+	input clk_in,
 
 	output ser_tx,
 	input ser_rx,
@@ -47,14 +47,34 @@ module icebreaker (
 	inout  flash_io2,
 	inout  flash_io3
 );
-	parameter integer MEM_WORDS = 32768;
+	wire clk;            // system clock, driven by PLL
+	wire pll_locked;
+
+	SB_PLL40_PAD #(
+		.FEEDBACK_PATH("SIMPLE"),
+		.DIVR(4'b0000),
+		.DIVF(7'b0101110),
+		.DIVQ(3'b101),
+		.FILTER_RANGE(3'b001)
+	) pll (
+		.PACKAGEPIN(clk_in),
+		.PLLOUTCORE(clk),
+		.RESETB(1'b1),
+		.BYPASS(1'b0),
+		.LOCK(pll_locked)
+	);
 
 	reg [5:0] reset_cnt = 0;
 	wire resetn = &reset_cnt;
 
 	always @(posedge clk) begin
-		reset_cnt <= reset_cnt + !resetn;
+		if (!pll_locked)
+			reset_cnt <= 0;
+		else
+			reset_cnt <= reset_cnt + !resetn;
 	end
+
+	parameter integer MEM_WORDS = 32768;
 
 	wire [7:0] leds;
 
@@ -128,7 +148,7 @@ module icebreaker (
 		.ENABLE_DIV(1),        // on: rv32im emits div/rem
 		.ENABLE_FAST_MUL(1),
 		.ENABLE_COMPRESSED(0), // off: rv32im has no C extension
-		.ENABLE_ICACHE(0),     // 1: instruction cache on; 0: direct flash fetch (baseline)
+		.ENABLE_ICACHE(1),     // 1: instruction cache on; 0: direct flash fetch (baseline)
 		.MEM_WORDS(MEM_WORDS)
 	) soc (
 		.clk          (clk         ),

@@ -430,7 +430,7 @@ void boot()
 {
 	// Low-current boot progress: ONE LED per step (led1 -> led2 -> led3), never the all-on word.
 	reg_leds = 0x02;            // led1
-	reg_uart_clkdiv = 104;      // 12 MHz / 115200 baud
+	reg_uart_clkdiv = 153;      // 17.625 MHz / 115200 baud
 	reg_7seg = 0x00;
 
 	reg_leds = 0x04;            // led2

@@ -78,7 +78,7 @@ icebreaker.asc: icebreaker.pcf icebreaker.json
 	nextpnr-ice40 --freq 17.625 --up5k --package sg48 --asc icebreaker.asc --pcf icebreaker.pcf --json icebreaker.json
 
 icebreaker.bin: icebreaker.asc
-	icetime -d up5k -c 12 -mtr icebreaker.rpt icebreaker.asc
+	icetime -d up5k -c 17.625 -mtr icebreaker.rpt icebreaker.asc
 	icepack icebreaker.asc icebreaker.bin
 
 icebprog: icebreaker.bin icebreaker_fw.bin

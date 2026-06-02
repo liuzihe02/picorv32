@@ -216,7 +216,10 @@ done
 
 ### Optimization Order
 
-Because the baseline is fetch-bound, Amdahl's Law dictates the dominant term first: **fetch latency before core CPI**. As long as each instruction stalls tens of cycles on flash, cutting core CPI from 4 to 1 gives basically no speedup (hence pipelining is useless for now). So the order is approximately:
+Because the baseline is fetch-bound, Amdahl's Law dictates the dominant term first: **fetch latency before core CPI**.
+> As long as each instruction stalls tens of cycles on flash, cutting core CPI from 4 to 1 gives basically no speedup (hence pipelining is useless for now). But this is fixed with instruction cache =)
+
+So the order is approximately:
 
 - fast-read defaults
 - instruction cache
@@ -576,11 +579,45 @@ little effect on hot loops (already ~100% hit); helps `cold` and large straight-
 
 ### Incremental CPI reductions
 
-Smaller wins within the existing multicycle FSM — stepping stones or pipeline fallbacks:
+Smaller wins within the repo
 
-- **`BARREL_SHIFTER=1`** — shifts finish combinationally (3 cyc) instead of iterating (up to ~14). ~200 LCs. Also a **prerequisite for pipelining** (a fixed-latency Execute stage can't tolerate the shift loop).
-- **Fast-path load/store** — loads/stores cost 5 cycles because the memory states are entered twice for the generic handshake. Data always targets 1-cycle SPRAM, so a fast path can collapse the second visit, saving a cycle per access with no pipeline machinery.
-- **Radix-4 SRT divider** — `pcpi_div` retires 1 quotient bit/cycle (~32 cyc); radix-4 does 2 bits/cycle (~16) for modest LCs. Helps any divide-bearing benchmark. (Multiply is already DSP-backed — leave it.)
+#### Barrel Shifter
+
+`BARREL_SHIFTER=1` shifts finish combinationally (3 cyc) instead of iterating (up to ~14). ~200 LCs. Also a **prerequisite for pipelining** (a fixed-latency Execute stage can't tolerate the shift loop).
+
+Effects are only noticeable with `ENABLE_ICACHE`:
+```
+benchmark (cycles  instrs  CPI  checksum)
+-- Compute --
+alu           12754952   1850038   6.89   82
+shift         11254283   1700031   6.62   0
+mul           12705209   2050038   6.19   124
+div           11124102   1240032   8.97   183
+branch        20669364   2974936   6.94   64
+call          27604492   4100028   6.73   32
+-- Memory --
+memcpy        6101478   930068   6.56   64
+chase         6082238   904386   6.72   136
+-- Fetch --
+hot           25803286   4000027   6.45   117
+cold          65926971   1029530   64.03   239
+-- Programs --
+bubble_sort   4755105   756032   6.28   77   branch/ld-st
+matmul        18702160   2922496   6.39   204   mul/ld-st
+crc32         19703862   3075453   6.40   0   shift/xor
+prime_count   5231708   521375   10.03   141   div/branch
+fir           27783350   4328124   6.41   214   mul/shift
+strsearch     10506752   1568299   6.69   200   ld/branch
+done
+```
+
+#### **Fast-path load/store**
+
+loads/stores cost 5 cycles because the memory states are entered twice for the generic handshake. Data always targets 1-cycle SPRAM, so a fast path can collapse the second visit, saving a cycle per access with no pipeline machinery.
+
+#### **Radix-4 SRT divider**
+
+`pcpi_div` retires 1 quotient bit/cycle (~32 cyc); radix-4 does 2 bits/cycle (~16) for modest LCs. Helps any divide-bearing benchmark. (Multiply is already DSP-backed — leave it.)
 
 ### Pipelining
 

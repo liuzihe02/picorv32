@@ -109,6 +109,7 @@ module picosoc (
 	wire        spimem_ready;
 	wire [31:0] spimem_rdata;
 
+	//cache ready shadows spimem_ready. pass through if disable icache.
 	wire        cache_ready;
 	wire [31:0] cache_rdata;
 

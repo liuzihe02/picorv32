@@ -3384,13 +3384,13 @@ The bus FSM is a 4-state machine \texttt{mem\_state[1:0]} that runs in parallel 
         node[lbl, above, pos=0.5] {do\_rinst} (s0);
 
     \end{tikzpicture}
-    \caption{Memory bus FSM. The idle state dispatches to read (state~1) or write (state~2) based on CPU request signals. Reads complete back to idle; prefetches park in state~3 until the CPU needs the instruction. An instruction cache would intercept the \texttt{mem\_do\_rinst} path: on a cache hit, it asserts \texttt{mem\_ready} directly without entering state~1.}
+    \caption{Memory bus FSM. The idle state dispatches to read (state~1) or write (state~2) based on CPU request signals. Reads complete back to idle; prefetches park in state~3 until the CPU needs the instruction. An instruction cache does \emph{not} change this FSM: it sits one layer out as a PicoSoC bus responder (selected by address, \S\ref{sec:picosoc}), so the bus FSM still issues \texttt{mem\_valid} and parks in state~1 --- the cache merely returns \texttt{mem\_ready} in ${\sim}2$ cycles on a hit instead of the ${\sim}128$ a flash read costs.}
     \label{fig:mem-fsm}
 \end{figure}
 
 \subsubsection{External bus layer}
 
-Finally, Table~\ref{tab:mem-signals} lists the wires that actually cross the CPU\,$\leftrightarrow$\,memory boundary --- the only layer the memory system sees. All CPU outputs are registered; inputs are sampled combinationally.
+Finally, Table~\ref{tab:mem-signals} lists the wires that actually cross the CPU\,$\leftrightarrow$\,memory boundary --- the only layer the memory system sees. All CPU outputs are registered; inputs are sampled combinationally. The instruction cache lives at \emph{this} layer: it is one of PicoSoC's external-bus responders (\S\ref{sec:picosoc}), answering \texttt{mem\_ready}/\texttt{mem\_rdata} for the flash address range, transparently to the CPU and bus FSM above.
 
 \begin{table}[htbp]
 \centering\small
@@ -3419,7 +3419,7 @@ Finally, Table~\ref{tab:mem-signals} lists the wires that actually cross the CPU
 
 \texttt{mem\_instr} lets the memory system route instruction fetches to SPI flash and data accesses to SPRAM. \texttt{mem\_wstrb} = \texttt{0000} signals a read; any non-zero pattern is a write with byte-granularity enables.
 
-\paragraph{Look-ahead interface.} Synchronous memories (EBR, SPRAM) need the address one clock cycle before the data is available. The look-ahead signals (\texttt{mem\_la\_*}) provide the address, data, and strobes \textbf{one cycle before} \texttt{mem\_valid}, so the memory can begin its internal access immediately and have the result ready when \texttt{mem\_valid} goes high. Figure~\ref{fig:mem-timing} shows the timing.\footnote{How to read the waveforms: a single-bit signal (e.g.\ \texttt{mem\_valid}) is one line that toggles high/low. A multi-bit bus (e.g.\ \texttt{mem\_addr}, \texttt{mem\_rdata}) is drawn as a flat line while it carries no meaningful value (idle/don't-care), and \emph{opens into a labelled band} only while it holds a valid value.}
+\paragraph{Look-ahead interface.} Synchronous memories (EBR, SPRAM) need the address one clock cycle before the data is available. The look-ahead signals (\texttt{mem\_la\_*}) provide the address, data, and strobes \textbf{one cycle before} \texttt{mem\_valid}, so the memory can begin its internal access immediately and have the result ready when \texttt{mem\_valid} goes high.\footnote{PicoSoC does not actually route the look-ahead bus (the \texttt{cpu} instance in \texttt{picosoc.v} wires only \texttt{mem\_valid/instr/ready/addr/wdata/wstrb/rdata}); its SPRAM instead uses a registered \texttt{ram\_ready} pulse, so a data access completes the cycle \emph{after} \texttt{mem\_valid} (one wait state) rather than the same cycle shown in Figure~\ref{fig:mem-timing}. That same-cycle response is the core interface's look-ahead \emph{capability}, not what this SoC wires up.} Figure~\ref{fig:mem-timing} shows the timing.\footnote{How to read the waveforms: a single-bit signal (e.g.\ \texttt{mem\_valid}) is one line that toggles high/low. A multi-bit bus (e.g.\ \texttt{mem\_addr}, \texttt{mem\_rdata}) is drawn as a flat line while it carries no meaningful value (idle/don't-care), and \emph{opens into a labelled band} only while it holds a valid value.}
 
 \begin{figure}[htbp]
     \centering
@@ -3457,15 +3457,35 @@ Finally, Table~\ref{tab:mem-signals} lists the wires that actually cross the CPU
         \texttt{mem\_ready}     & 2L H 2L       \\
       \end{tikztimingtable}
     \end{minipage}
-    \caption{Memory bus timing for (a) a load and (b) a store, drawn with the look-ahead interface. The \texttt{mem\_la\_*} signals present the address (and, for a store, the write data and strobes) \textbf{one cycle before} \texttt{mem\_valid}, giving synchronous memory (EBR/SPRAM) a cycle to register the address. \texttt{mem\_instr}=0 in both, since these are data accesses (an instruction fetch would assert it); \texttt{mem\_wstrb}=\texttt{0000} marks the load as a read, \texttt{1111} a full-word store. Here the memory responds immediately (\texttt{mem\_ready} in the same cycle as \texttt{mem\_valid}), so each transaction completes in one \texttt{mem\_valid} cycle; a slower memory holds \texttt{mem\_ready} low to insert wait states.}
+    \caption{Memory bus timing for (a) a load and (b) a store, drawn with the look-ahead interface. The \texttt{mem\_la\_*} signals present the address (and, for a store, the write data and strobes) \textbf{one cycle before} \texttt{mem\_valid}, giving synchronous memory (EBR/SPRAM) a cycle to register the address. \texttt{mem\_instr}=0 in both, since these are data accesses (an instruction fetch would assert it); \texttt{mem\_wstrb}=\texttt{0000} marks the load as a read, \texttt{1111} a full-word store. These are \emph{data} accesses, which in PicoSoC target single-cycle SPRAM; \emph{instruction} fetches instead go to SPI flash and stall for many wait states (Figure~\ref{fig:mem-timing-flash}). Here the memory responds immediately (\texttt{mem\_ready} in the same cycle as \texttt{mem\_valid}), so each transaction completes in one \texttt{mem\_valid} cycle; a slower memory holds \texttt{mem\_ready} low to insert wait states.}
     \label{fig:mem-timing}
+\end{figure}
+
+By contrast, an instruction fetch targets SPI flash, and \texttt{spimemio} holds \texttt{mem\_ready} low for many cycles (while \texttt{spimemio} is reading).
+
+\begin{figure}[htbp]
+    \centering
+    \begin{tikztimingtable}[timing/wscale=3, timing/dslope=0.08,
+      timing/d/background/.style={fill=blue!6}]
+      \texttt{clk}           & 8{C}                       \\
+      \texttt{mem\_la\_read} & L H 6L                     \\
+      \texttt{mem\_la\_addr} & Z D{addr} 6Z               \\
+      \texttt{mem\_valid}    & 2L 5H L                    \\
+      \texttt{mem\_instr}    & 2L 5H L                    \\
+      \texttt{mem\_addr}     & 2Z 5D{flash addr (held)} Z \\
+      \texttt{mem\_wstrb}    & 2Z 5D{0000} Z              \\
+      \texttt{mem\_ready}    & 6L H L                     \\
+      \texttt{mem\_rdata}    & 6Z D{instr} Z \\
+    \end{tikztimingtable}
+    \caption{Instruction fetch from SPI flash --- the slow path. \texttt{mem\_instr}=1 routes the request to \texttt{spimemio}; \texttt{mem\_wstrb}=\texttt{0000} marks it a read. Unlike the single-cycle SPRAM accesses of Figure~\ref{fig:mem-timing}, the flash controller holds \texttt{mem\_ready} \emph{low} for many SPI cycles, while \texttt{mem\_valid}/\texttt{mem\_addr} stay asserted; \texttt{mem\_rdata} returns only on the final cycle. The wait window here is compressed --- a real single-bit fetch is $\sim$64 SPI clocks $\approx$ 128 system cycles at the 2:1 SCK divider (\S\ref{sec:spimemio}).}
+    \label{fig:mem-timing-flash}
 \end{figure}
 
 \newpage
 \subsection{SPI Flash Controller (\texttt{spimemio})}
 \label{sec:spimemio}
 
-\texttt{spimemio} is the only block that drives the flash pins; it serves instruction fetches and exposes a config register at \texttt{0x02000000}. It has \emph{no cache} --- it \emph{streams} sequential reads, advancing word by word. Since all code runs in place from flash (Section~\ref{sec:picosoc}), it sets the fetch latency that dominates the baseline (Section~\ref{sec:optspace}).
+\texttt{spimemio} serves instruction fetch requests from the CPU (specifically memory bus FSM) and exposes a config register at \texttt{0x02000000}. It has \emph{no cache} --- it \emph{streams} sequential reads, advancing word by word. Since all code runs in place from flash (Section~\ref{sec:picosoc}), it sets the fetch latency that dominates the baseline (Section~\ref{sec:optspace}).
 
 \paragraph{Transaction structure.} A read is a fixed sequence of phases driven by a 13-state FSM (Table~\ref{tab:spimemio-phases}, Figure~\ref{fig:spimemio-fsm}); the inner \texttt{spimemio\_xfer} engine shifts each byte over the flash pins at SCK = half the system clock rate. Single-bit SPI shifts 1 bit per SCK, while Dual-/Quad-I/O shift 2/4 bits --- using less number of SPI cycles (Figure~\ref{fig:spi-timing}). These are all \emph{single-data-rate} (SDR): one transfer per rising SCK edge, so the lane count (1/2/4) sets the bits per clock. \emph{Double-data-rate} (DDR) clocks data on \emph{both} the rising and falling edges of SCK, doubling the bits-per-clock again, so quad-DDR (\texttt{0xED}) moves 8 bits per SCK, twice quad-SDR. The price is tighter I/O timing, since the controller must drive and sample data on both edges (the negedge-registered \texttt{xfer\_io*\_90} path in \texttt{spimemio\_xfer}).
 

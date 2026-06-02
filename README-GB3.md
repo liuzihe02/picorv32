@@ -5,6 +5,7 @@ This is a design document containing brief background and implementation plan fo
 ## Tips
 
 - Zach reccomends using [markdown-preview-enhanced](https://shd101wyy.github.io/markdown-preview-enhanced/#/) to view md files.
+  - This also supports `tikz` diagrams. Use latex engines like `latexmk` or `pdf2svg` or whatever to render these in md, and then do `ctrl + shift + enter` to render them all at once
 - Instead of using `screen /dev/ttyUSB1 115200` which can screw up scrolling with mouse and copying, install and use `tio -b 115200 /dev/ttyUSB1` which simply prints to terminal
 
 ## Core Files (For LLM context)
@@ -250,12 +251,11 @@ The example firmware's `boot()` sets the *flash chip's* QE bit but never switche
 
 ### Instruction cache
 
-Loops re-fetch the same instructions every iteration; an EBR-backed cache serves repeats in a fixed **2 cycles** (vs the tens of cycles a flash fetch costs), and the `while(1)` structure means a ~100% hit rate after the first iteration. (Complementary to fast-read, which only shrinks the cold-miss penalty.) Running code directly from SPRAM is *not* an option — the linker script pins `.text` to flash, SPRAM is fully allocated to data, and SPRAM isn't pre-loadable — so "execute from SPRAM" collapses to exactly this bus-resident cache.
+Loops re-fetch the same words every iteration, so an EBR-backed cache that answers a repeat in **2 cycles** — instead of the many tens a flash word costs — collapses the fetch-bound baseline (~70 CPI) to **~6.4 CPI**.
 
-It sits on the PicoSoC bus alongside `spimemio`, selected by the flash **address range** (`4*MEM_WORDS ≤ addr < 0x02000000`) in `picosoc.v` — so it only ever sees instruction fetches, since the flash region holds only `.text` (no D-cache needed — SPRAM is already 1-cycle; `mem_instr` is not consulted). On a hit it returns the cached word and asserts `cpu_ready` (→ `mem_ready`) two cycles after the request; on a miss it forwards to flash, caches the returned word, then responds. It is gated by the `ENABLE_ICACHE` parameter (default 1; set 0 to wire the CPU straight to `spimemio` — the pre-cache fetch path).
+Running from SPRAM instead is impossible (`.text` is pinned to flash, SPRAM is full of data and isn't pre-loadable), so the only fast instruction store is this bus-resident cache in EBR. `ENABLE_ICACHE` toggles its synthesis.
 
-**Implemented** (`icache.v`): a direct-mapped, 256-entry, 1-word-per-block cache (1 KB) using ~2 EBR for data, with the address split as `tag[31:10]` / `set[9:2]` / `byte[1:0]`. The tag array holds 256 × (1 valid + 14 tag) bits in one EBR; a post-reset sweep clears the valid bits before the first lookup (EBR powers up undefined). A 3-state FSM (idle → check → fill) reads the tag/data EBR, compares, and on a miss forwards to `spimemio` then caches the returned word. Scaling knobs if needed: larger capacity (e.g. 4 KB / ~8 EBR) cuts capacity misses; 2-way cuts conflict misses where two hot addresses alias; multi-word blocks add spatial locality at a higher miss penalty. Instruction caches are read-only, so no write policy is needed.
-
+Performance benchmarks:
 ```txt
 benchmark (cycles  instrs  CPI  checksum)
 -- Compute --
@@ -281,7 +281,298 @@ strsearch     10523128   1568299   6.70   200   ld/branch
 done
 ```
 
-A **loop buffer** (loop-stream detector, no tag array) is a cheaper fallback if LCs get tight — same ~100% hit rate for tight loops, but no help for straight-line or nested code.
+
+#### Memory Bus
+
+`picosoc.v` decodes the single `mem_*` bus by address into parallel *responders*, whose `*_ready`/`*_rdata` are OR/priority-mux'd back to the CPU:
+
+```
+mem_ready = (iomem_valid && iomem_ready)        // GPIO etc. (icebreaker.v)
+          || cache_ready                         // flash region (icache -> spimemio)
+          || ram_ready                           // SPRAM
+          || spimemio_cfgreg_sel                 // 0x02000000
+          || simpleuart_reg_div_sel              // 0x02000004
+          || (simpleuart_reg_dat_sel && !wait);  // 0x02000008
+mem_rdata = priority-mux in the same order      
+```
+
+- The cache is **one responder on the flash range** (`0x00020000 ≤ addr < 0x02000000`), chosen purely by address — `mem_instr` is never consulted. Flash holds only read-only `.text`/`.rodata`, so every access it sees is a read: no write policy needed. It's really a *(read-only flash) cache*, not strictly an I-cache.
+- Note **SPRAM answers in 1 cycle** — `ram_ready <= mem_valid && !mem_ready && addr < 4*MEM_WORDS`, a registered pulse the cycle after the request. 2-cycle cache hit still slower.
+
+#### SoC block diagram — baseline vs with cache
+
+**Baseline (`ENABLE_ICACHE=0`)** — the `mem_*` bus fans out by address; `spimemio` serves the flash region directly.
+
+```latex {cmd=true hide=true latex_zoom=1.7}
+\documentclass[tikz,border=8pt]{standalone}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, fit, backgrounds}
+\begin{document}
+\begin{tikzpicture}[>=Stealth, semithick, scale=0.82, every node/.style={transform shape},
+  blk/.style={draw, rounded corners=2pt, minimum height=0.8cm,
+              minimum width=2.0cm, font=\sffamily\scriptsize, align=center},
+  arr/.style={->, thick},
+  lbl/.style={font=\sffamily\tiny},
+  flbl/.style={font=\sffamily\tiny, fill=white, inner sep=1pt}]
+  \begin{scope}[on background layer]
+  \fill[green!4, rounded corners=6pt] (-2.6, -3.2) rectangle (14.0, 4.0);
+  \draw[green!40!black!30, thick, rounded corners=6pt] (-2.6, -3.2) rectangle (14.0, 4.0);
+  \node[font=\sffamily\scriptsize\bfseries, green!40!black] at (5.7, 3.75) {icebreaker.v};
+  \fill[blue!5, rounded corners=4pt] (-2.2, -2.8) rectangle (10.2, 3.5);
+  \draw[blue!40, thick, rounded corners=4pt] (-2.2, -2.8) rectangle (10.2, 3.5);
+  \node[font=\sffamily\scriptsize\bfseries, blue!50!black] at (4.0, 3.25) {picosoc.v};
+  \end{scope}
+  \node[blk, fill=blue!20, minimum height=1.6cm, minimum width=2.4cm] (cpu) at (0, 0.5) {};
+  \node[font=\sffamily\scriptsize, align=center] at (0, 0.92) {picorv32\\CPU};
+  \node[blk, fill=blue!35, minimum height=0.5cm, minimum width=1.9cm, font=\sffamily\tiny] (rf) at (0, 0.08) {register file (4$\times$ EBR)};
+  \node[blk, fill=red!6, minimum width=2.0cm, minimum height=3.8cm] (adec) at (4.0, 0.95) {Address\\Decode};
+  \draw[arr] (cpu.east) -- (adec.west) node[midway, above, lbl] {\texttt{mem\_*}};
+  \node[blk, fill=blue!22] (spram)  at (8.0, 2.6) {SPRAM\\128\,KB};
+  \node[blk, fill=blue!16]  (flash)  at (8.0, 1.5) {spimemio\\SPI Flash};
+  \node[blk, fill=yellow!12](spicfg) at (8.0, 0.5) {UART};
+  \node[blk, fill=gray!15, minimum width=2.2cm] (iomem) at (8.0, -0.7) {iomem bus / GPIO};
+  \draw[arr] (adec.east |- spram)  -- (spram.west)  node[midway, flbl] {\texttt{< 0x00020000}};
+  \draw[arr] (adec.east |- flash)  -- (flash.west)  node[midway, flbl] {\texttt{0x00020000+}};
+  \draw[arr] (adec.east |- spicfg) -- (spicfg.west) node[midway, flbl] {\texttt{0x02000004/8}};
+  \draw[arr] (adec.east |- iomem)  -- (iomem.west)  node[midway, flbl] {\texttt{>= 0x02000000}};
+  \node[blk, fill=gray!15, minimum width=1.6cm] (gpio) at (12.2, -0.7) {LEDs};
+  \node[blk, fill=gray!15, minimum width=1.6cm] (sevs) at (12.2, -1.8) {7-seg};
+  \draw[arr] (iomem.east) -- ++(0.5, 0) coordinate (iofan);
+  \draw[arr] (iofan) |- (gpio.west) node[pos=0.25, above, lbl] {\texttt{0x03..}};
+  \draw[arr] (iofan) |- (sevs.west);
+  \begin{scope}[on background layer]
+  \draw[<-, thick, blue!50] (cpu.south) -- (0, -2.4) -- (9.2, -2.4)
+    node[pos=0.5, below, flbl, text=blue!50] {\texttt{mem\_ready / mem\_rdata}};
+  \foreach \nd/\xoff in {spram/-0.3, flash/-0.1, spicfg/0.1, iomem/0.3} {
+    \draw[thick, blue!50] ([xshift=\xoff cm]\nd.south) -- ([xshift=\xoff cm]\nd.south |- 0,-2.4);
+  }
+  \end{scope}
+  \node[draw, rounded corners=2pt, fill=gray!8, font=\sffamily\tiny, inner sep=3pt, align=center] (bflash) at (11.5, 1.5) {W25Q128\\Flash};
+  \node[draw, rounded corners=2pt, fill=gray!8, font=\sffamily\tiny, inner sep=3pt, align=center] (buart) at (11.5, 0.5) {FT2232H\\UART};
+  \draw[arr, gray] (flash.east) -- (bflash.west) node[midway, above, lbl] {QSPI};
+  \draw[arr, gray] (spicfg.east) -- (buart.west) node[midway, above, lbl] {TX/RX};
+\end{tikzpicture}
+\end{document}
+```
+
+**With the cache (`ENABLE_ICACHE=1`)** — hits return on the same bus, misses fall through to `spimemio` via `spi_*`
+
+```latex {cmd=true hide=true latex_zoom=1.7}
+\documentclass[tikz,border=8pt]{standalone}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, fit, backgrounds}
+\begin{document}
+\begin{tikzpicture}[>=Stealth, semithick, scale=0.78, every node/.style={transform shape},
+  blk/.style={draw, rounded corners=2pt, minimum height=0.8cm,
+              minimum width=2.0cm, font=\sffamily\scriptsize, align=center},
+  arr/.style={->, thick},
+  lbl/.style={font=\sffamily\tiny},
+  flbl/.style={font=\sffamily\tiny, fill=white, inner sep=1pt}]
+  \begin{scope}[on background layer]
+  \fill[green!4, rounded corners=6pt] (-2.6, -3.4) rectangle (14.8, 4.0);
+  \draw[green!40!black!30, thick, rounded corners=6pt] (-2.6, -3.4) rectangle (14.8, 4.0);
+  \node[font=\sffamily\scriptsize\bfseries, green!40!black] at (6.0, 3.75) {icebreaker.v};
+  \fill[blue!5, rounded corners=4pt] (-2.2, -3.0) rectangle (11.0, 3.4);
+  \draw[blue!40, thick, rounded corners=4pt] (-2.2, -3.0) rectangle (11.0, 3.4);
+  \node[font=\sffamily\scriptsize\bfseries, blue!50!black] at (-0.9, 3.15) {picosoc.v};
+  \end{scope}
+  \node[blk, fill=blue!20, minimum height=1.6cm, minimum width=2.4cm] (cpu) at (0, 0.5) {};
+  \node[font=\sffamily\scriptsize, align=center] at (0, 0.92) {picorv32\\CPU};
+  \node[blk, fill=blue!35, minimum height=0.5cm, minimum width=1.9cm, font=\sffamily\tiny] (rf) at (0, 0.08) {register file (4$\times$ EBR)};
+  \node[blk, fill=red!6, minimum width=1.7cm, minimum height=4.4cm] (adec) at (3.4, 0.5) {Address\\Decode};
+  \draw[arr] (cpu.east) -- (adec.west) node[midway, above, lbl] {\texttt{mem\_*}};
+  \node[blk, fill=green!18, minimum height=1.0cm, minimum width=1.9cm,
+        draw=green!50!black, thick, dashed] (cache) at (6.5, 2.4) {Instr Cache\\{\tiny 256$\times$32 EBR}};
+  \node[blk, fill=blue!16]  (flash)  at (9.6, 2.4) {spimemio\\SPI Flash};
+  \node[blk, fill=blue!22]  (spram)  at (9.6, 1.0) {SPRAM\\128\,KB};
+  \node[blk, fill=yellow!12](spicfg) at (9.6, -0.3){SPI cfg / UART};
+  \node[blk, fill=gray!15, minimum width=2.2cm] (iomem) at (9.6, -1.5) {iomem bus};
+  \draw[arr, green!50!black] (adec.east |- cache) -- (cache.west)
+    node[midway, flbl, text=green!50!black] {\texttt{0x20000..0x1FFFFFF}};
+  \draw[arr] (cache.east) -- (flash.west) node[midway, above, lbl] {miss \texttt{(spi\_*)}};
+  \draw[arr] (adec.east |- spram)  -- (spram.west)  node[midway, flbl] {\texttt{< 0x20000}};
+  \draw[arr] (adec.east |- spicfg) -- (spicfg.west) node[midway, flbl] {\texttt{0x0200\_000x}};
+  \draw[arr] (adec.east |- iomem)  -- (iomem.west)  node[midway, flbl] {\texttt{[31:24]>0x01}};
+  \node[blk, fill=gray!15, minimum width=1.4cm] (gpio) at (13.0, -1.1) {LEDs};
+  \node[blk, fill=gray!15, minimum width=1.4cm] (sevs) at (13.0, -2.2) {7-seg};
+  \draw[arr] (iomem.east) -- ++(0.4,0) coordinate (iofan);
+  \draw[arr] (iofan) |- (gpio.west) node[pos=0.25, above, lbl] {\texttt{0x03..}};
+  \draw[arr] (iofan) |- (sevs.west);
+  \begin{scope}[on background layer]
+  \draw[<-, thick, blue!50] (cpu.south) -- (0, -2.6) -- (10.3, -2.6)
+    node[pos=0.5, below, flbl, text=blue!50] {\texttt{mem\_ready / mem\_rdata}};
+  \foreach \nd/\xoff in {cache/0, spram/-0.2, spicfg/0, iomem/0.2} {
+    \draw[thick, blue!50] ([xshift=\xoff cm]\nd.south) -- ([xshift=\xoff cm]\nd.south |- 0,-2.6);
+  }
+  \end{scope}
+  \node[draw, rounded corners=2pt, fill=gray!8, font=\sffamily\tiny, inner sep=3pt, align=center]
+    (bflash) at (12.7, 2.4) {W25Q128\\Flash};
+  \draw[arr, gray] (flash.east) -- (bflash.west) node[midway, above, lbl] {QSPI};
+\end{tikzpicture}
+\end{document}
+```
+
+#### Structure
+
+Direct-mapped, 256 lines × 1 word = **1 KB**, read-only (no write policy). Our cache comprises of two arrays, both inferred synsthesized to EBR:
+
+```verilog
+reg [31:0] data_mem [0:255];   // 256x32 -> 2 EBR (16-bit-wide blocks paired)
+reg [14:0] tag_mem  [0:255];   // 256x15  (bit14 = valid, [13:0] = tag) -> 1 EBR
+```
+
+**3 EBR** of 26 utilized. The 24-bit flash address `cpu_addr = mem_addr[23:0]` splits as:
+
+```text
+┌──────────────────────────────────────────────────────────┬──────────────────────────────┬──────┐
+│                       tag (14)                           │          index (8)           │  00  │
+└──────────────────────────────────────────────────────────┴──────────────────────────────┴──────┘
+23                                                       10|9                            2|1    0
+
+              which line holds it?                     which of 256 sets          word-aligned
+```
+
+For a hit, both `index` and `tag` bits must align. First, we index into the cache with `tag_mem[cpu_addr[9:2]]`. If the full tag and index matches `tag_mem[cpu_addr[9:2]]==cpu_addr[23:10]`, and the bit is valid, then we have a hit. Otherwise cache miss need to fetch from `spimemio` next cycle.
+
+#### EBR Reset
+
+A post-reset sweep clears every valid bit before the first cache lookup. EBR powers up undefined, so a stale tag could falsely match.
+
+> In sim the uninitialised `tag_mem` reads `X` and the hit-compare is *accidentally* false, so sweep was unneccessary. Hardware runs into issues
+
+#### Cache FSM
+
+Three steady-state states (entered once the reset sweep above finishes). `cpu_ready` and `spi_valid` default to 0 every cycle, so they are single-cycle pulses unless re-asserted.
+
+```latex {cmd=true hide=true latex_zoom=1.7}
+\documentclass[tikz,border=8pt]{standalone}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta}
+\begin{document}
+\begin{tikzpicture}[>=Stealth, semithick,
+  st/.style={draw, circle, minimum size=1.25cm, font=\sffamily\tiny, inner sep=0.5pt, align=center},
+  lbl/.style={font=\sffamily\tiny, inner sep=1.5pt, fill=white, align=center}]
+
+  \node[st, fill=gray!15]  (idle) at (0, 0)     {idle\\(0)};
+  \node[st, fill=green!12] (chk)  at (5.0, 0)    {check\\(1)};
+  \node[st, fill=blue!15]  (fill) at (5.0, -3.4) {fill\\(2)};
+
+  \draw[->] (-1.8, 0) -- node[lbl, above] {reset} (idle);
+
+  % labels go BETWEEN the coords (edge midpoint); a node after the last coord lands ON it
+  \draw[->] (idle) to[bend left=20] node[lbl, above] {cpu\_valid\\\&\,!cpu\_ready} (chk);
+  \draw[->] (chk)  to[bend left=20] node[lbl, below] {hit:\\cpu\_ready} (idle);
+
+  \draw[->] (chk) -- node[lbl, right] {miss:\\spi\_valid} (fill);
+  \path (fill) edge[->, loop right, looseness=6] node[lbl] {!spi\_ready} (fill);
+  \draw[->] (fill) to[bend left=20] node[lbl, above left] {spi\_ready:\\fill line,\\cpu\_ready} (idle);
+
+\end{tikzpicture}
+\end{document}
+```
+
+- **idle**
+  - on a cache request, latch the index	`req_idx <= cpu_addr[9:2]` and tag `req_tag <= cpu_addr[23:10]`
+    - `req_tag` is compared next cycle in `check`
+  - latch the tag + data EBR reads (`tag_q <= tag_mem[idx]`, `data_q <= data_mem[idx]`) — synchronous, so the latch lands next cycle
+- **check**
+  - Index into `tag_mem`, then compare the tag bits and valid bit `(tag_q == {1'b1, req_tag})`
+  - On **hit**, then store the word data, ack the CPU `cpu_ready<=1`
+  - On **miss**, then kick off a SPI flash read.
+- **fill**
+  - hold the flash request until `spi_ready` when SPI read is done
+  - write the instruction word into cache, then ack CPU and return it
+
+> The `!cpu_ready` term in idle's accept condition drops the one stale cycle right after a hit — when `cpu_ready` and `cpu_valid` are both still high — so the FSM doesn't re-latch the just-finished address as a phantom request.
+
+#### Timing
+
+Signals `cpu_valid`/`cpu_ready` represent `CPU--cache` request/ack
+Signals `spi_valid`/`spi_ready` represent `cache--SPI` on a miss
+
+In the **baseline** (no cache), every taken branch/call/return is a **non-sequential** fetch driven straight into `spimemio`. With nothing in the path, `spi_valid`/`spi_ready` (the `spimemio` handshake) are just `mem_valid`/`mem_ready` passed through — **same edges, no offset**. `spimemio` raises `jump`, re-runs the full command + address + dummy + data, and holds ready **low** the whole time — ~**128 system cycles**, not to scale:
+
+```latex {cmd=true hide=true latex_zoom=1.5}
+\documentclass[tikz,border=8pt]{standalone}
+\usepackage{tikz}
+\usepackage{tikz-timing}
+\begin{document}
+\begin{tikztimingtable}[timing/wscale=1.4, timing/dslope=0.08,
+  timing/d/background/.style={fill=blue!6}]
+  \texttt{clk}          & 16{C}                                \\
+  \texttt{mem\_valid}   & 2L 13H L                             \\
+  \texttt{spi\_valid}   & 2L 13H L                             \\
+  \texttt{mem\_addr}    & 2Z 13D{target} Z                     \\
+  \texttt{spi\_ready}   & 14L H L                              \\
+  \texttt{mem\_ready}   & 14L H L                              \\
+  \texttt{mem\_rdata}   & 14Z {[timing/d/background/.style={fill=green!8}] D{instr}} Z \\
+\end{tikztimingtable}
+\end{document}
+```
+
+With a cache, the same fetch **hits** in **2 cycles** — `idle` latches + launches the EBR read, `check` compares and raises the *registered* `cpu_ready` (equivalent = `mem_ready`, next cycle):
+
+```latex {cmd=true hide=true latex_zoom=1.5}
+\documentclass[tikz,border=8pt]{standalone}
+\usepackage{tikz}
+\usepackage{tikz-timing}
+\begin{document}
+\begin{tikztimingtable}[timing/wscale=2, timing/dslope=0.08,
+  timing/d/background/.style={fill=blue!6}]
+  \texttt{clk}           & 8{C}                            \\
+  \texttt{mem\_valid}    & 2L 3H 3L                        \\
+  \texttt{spi\_valid}    & 8L                              \\
+  \texttt{mem\_addr}     & 2Z 3D{target} 3Z                \\
+  \texttt{spi\_ready}    & 8L                              \\
+  \texttt{cache\_state}  & 3D{idle} D{check} 4D{idle}      \\
+  \texttt{mem\_ready}    & 4L H 3L                         \\
+  \texttt{mem\_rdata}    & 4Z {[timing/d/background/.style={fill=green!8}] D{instr}} 3Z \\
+\end{tikztimingtable}
+\end{document}
+```
+
+So **~128 → 2** on every taken branch/call/return.
+
+However,
+
+- **Still 1 cycle slower than SPRAM** (which acks at T+1, below) — purely because `cpu_ready` is *registered* in `check`; `idle` spends a whole cycle just launching the EBR read. That one cycle per fetch is why the plateau is **~6.4 CPI, not ~4**:
+
+```latex {cmd=true hide=true latex_zoom=1.5}
+\documentclass[tikz,border=8pt]{standalone}
+\usepackage{tikz}
+\usepackage{tikz-timing}
+\begin{document}
+\begin{tikztimingtable}[timing/wscale=2.4, timing/dslope=0.08,
+  timing/d/background/.style={fill=blue!6}]
+  \texttt{clk}        & 5{C}                       \\
+  \texttt{mem\_valid} & L 2H 2L                    \\
+  \texttt{ram\_ready} & 2L H 2L                    \\
+  \texttt{ram\_rdata} & 2Z {[timing/d/background/.style={fill=green!8}] D{word}} 2Z \\
+\end{tikztimingtable}
+\end{document}
+```
+
+- **`cold` fetches about 1.0x** — straight-line misses come out in order, so `spimemio` streams them exactly as the no-cache baseline did. The full **miss path** = 2-cycle check + the `spimemio` transaction + a 1-cycle fill ack.
+
+#### Further Optimizations
+
+The scored benchmarks are `while(1)` hot loops at ~100% hit after warmup, so **hit latency dominates and the miss rate is already ~0** so cutting hit latency is the optimization
+
+##### Cut the hit latency (2 → 1 cycle)
+
+1. **Combinational hit response.** Drive `cpu_ready`/`cpu_rdata` combinationally in `check` (`assign cpu_ready = (state==check) && hit;`) so a hit answers at $T{+}1$ like SPRAM — halving the hit penalty. Cost: a longer combinational path (EBR-out → tag compare → `mem_ready` → CPU, through the `mem_rdata` mux), so re-check $f_{max}$ after. Highest-leverage single tweak.
+
+2. **Route the look-ahead interface.** picorv32 exposes `mem_la_addr`/`mem_la_read` one cycle early, but `picosoc.v` doesn't wire them to the cache (the `cpu` instance connects only `mem_valid/instr/ready/addr/wdata/wstrb/rdata`). Bringing `mem_la_*` out lets the cache start the EBR read a cycle ahead and present data the instant `mem_valid` rises — a true 1-cycle hit without the combinational-path risk of (1). Bigger change (new ports through `picosoc`), but it is how synchronous memory is meant to be driven.
+
+##### Cut the miss rate / cost
+
+little effect on hot loops (already ~100% hit); helps `cold` and large straight-line code:
+
+3. **Multi-word lines (larger block size).** Fetch *N* words per line instead of 1, exploiting spatial locality. Since `spimemio` already *streams* sequential words cheaply (data-phase only after the first), a 4-word line amortizes the command + address + dummy over 4 words and cuts the per-miss `idle→check` overhead. ("Multi-word lines" and "bigger block size" are the same knob.)
+
+4. **More capacity** (e.g. 4 KB / ~8 EBR vs the current 1 KB) — fewer *capacity* misses.
+
+5. **2-way set-associative** — fewer *conflict* misses where two hot addresses alias to the same line. Usually the better miss-rate spend than block size for a small cache.
 
 ### Incremental CPI reductions
 

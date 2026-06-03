@@ -3925,7 +3925,7 @@ Figure~\ref{fig:picosoc-block} shows the PicoSoC architecture with address decod
 
     % Peripherals (stacked vertically, right of decoder)
     \node[blk, fill=blue!22] (spram)  at (8.0, 2.6) {SPRAM\\128\,KB};
-    \node[blk, fill=blue!16]  (flash)  at (8.0, 1.5) {spimemio\\SPI Flash};
+    \node[blk, fill=blue!16]  (flash)  at (8.0, 1.5) {spimemio};
     \node[blk, fill=yellow!12](spicfg) at (8.0, 0.5) {UART};
     \node[blk, fill=gray!15, minimum width=2.2cm] (iomem) at (8.0, -0.7) {iomem bus / GPIO};
 
@@ -3963,7 +3963,7 @@ Figure~\ref{fig:picosoc-block} shows the PicoSoC architecture with address decod
     % EXTERNAL COMPONENTS (right edge, outside both boxes)
     % ============================
     \node[draw, rounded corners=2pt, fill=gray!8, font=\sffamily\tiny, inner sep=3pt, align=center]
-      (bflash) at (11.5, 1.5) {W25Q128\\Flash};
+      (bflash) at (11.5, 1.5) {W25Q128\\16MB SPI Flash};
     \node[draw, rounded corners=2pt, fill=gray!8, font=\sffamily\tiny, inner sep=3pt, align=center]
       (buart) at (11.5, 0.5) {FT2232H\\UART};
 

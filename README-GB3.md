@@ -110,12 +110,11 @@ Every benchmark — micro or program — is a `uint8_t bench_NAME(void)` (frozen
 - **Return a byte checksum folded from all the work**, so dead-code elimination can't delete the kernel.
 - **Fixed seeds / static SPRAM inputs** (`xorshift32` for any pseudo-random data) → deterministic `N`, cycle count, and a known-good checksum that doubles as a correctness regression test after each hardware edit.
 - **An inner loop count** (a literal in each kernel, e.g. `50000`) scales the run into a clean Picoscope window *without changing the instruction mix*.
-- **Measurement**: `time_benchmark()` logs `cycles` / `instrs` / `CPI` over UART (sim and board) — driven per-suite by `run_benchmarks()` (menu `T`, all 16) and on the scored path by `run_scope()` (menu `B`), which loops `run_workload()` and toggles LED1. Two ways to get **wall-clock time**:
+- **Measurement**: `time_benchmark()` logs `cycles`/`instrs`/`CPI` over UART — per-suite via `run_benchmarks()` (menu `T`) or the scored path `run_scope()` (menu `B`, loops `run_workload()` + toggles LED1). **Wall-clock**, two ways:
+  - **A — UART, any benchmark:** $t = \text{cycles}/f_{clk}$, but no hand math — the dashboard prints an `ms` column (`print_ms()`, driven by `F_CLK_HZ` in `benchmarks.h`, the single source of truth that also sets the UART divisor). Cleanest for the kernel; `time_benchmark` brackets only `fn()`.
+  - **B — scope, ground-truth:** LED1 is a square wave → wall-clock/pass = period/2; auto-accounts for `f_clk`, but only the one scored workload.
 
-  - **Method A — from the UART cycle count (works for every benchmark).** `rdcycle` counts *clock cycles, not time*, so wall-clock is $t = \text{cycles}/f_{clk}$ (e.g. matmul $18{,}702{,}160 / 17.625\text{ MHz} \approx 1.06$ s/pass). **You don't divide by hand** — `run_benchmarks`/`run_scope` print an `ms` column via `print_ms()`, which uses the **`F_CLK_HZ` constant in `benchmarks.h`** (the single source of truth: `boot()` derives the UART divisor from it too, so changing the PLL means editing *one* `#define`). This is the cleanest figure for the kernel itself: `time_benchmark` brackets *only* `fn()`, so no UART/print overhead leaks in.
-  - **Method B — Picoscope on LED1 (the scored, ground-truth method).** `run_scope` toggles LED1 once per pass → a square wave; wall-clock per pass = **period / 2** (it toggles every pass, so a full period spans two). The scope measures real time, so it auto-accounts for `f_clk`. Only scopes the *one* benchmark in `run_workload()`; for the full suite use Method A per line.
-
-  The two should agree — if they don't, your `f_clk` is wrong, and you can back out the real clock as $f_{clk} = \text{cycles} / (\text{LED1 period}/2)$ (a reliable way to confirm the PLL frequency). Cross-check either against $T_{\text{exec}} = N \times \text{CPI} \times T_c$; `N` is fixed by the frozen source, so every delta is pure $\text{CPI} \times T_c$.
+  They should agree; if not, `f_clk` is off (back it out as $f_{clk} = \text{cycles}/(\text{period}/2)$). `N` is frozen, so every delta is pure $\text{CPI} \times T_c$.
 - **Size every benchmark to a similar runtime** so the dashboard reads cleanly. Each kernel's code footprint (`size` of its `bench_*`) predicts cache behaviour.
 
 ### Layer 1 — Core-operation microbenchmarks
@@ -137,9 +136,16 @@ Organised by the three sources of CPI (the fetch-stall vs core split above) — 
 
 The fetch pair matters most for this CPU: `bench_hot` and `bench_cold` run the same arithmetic at opposite footprints, so together they separate "hot code stayed hot" (cache) from "cold/large code got cheaper" (fast-read).
 
+**Planned — non-sequential fetch (the QSPI gap).** With the cache on, `bench_hot` and all 6 programs hit ~100% (~6.4 CPI), so flash fast-read surfaces *only* in `bench_cold` — which isn't in the scored geomean. There are two cache-miss regimes, and only the first is covered:
+
+- **Sequential** (straight-line > cache, e.g. `bench_cold`): consecutive misses stream from `spimemio` (data phase only), so fast-read shrinks just that phase.
+- **Non-sequential / jumpy** (working set > cache): every miss re-runs the full command + address + dummy + data — ~4–8× costlier per miss, the regime where fast-read helps *most* and the only one where CRM pays off. Covered by `bench_interp` (Layer 2).
+
+A graded-footprint ladder (`cold` unrolled to < / ≈ / ≫ cache) was considered but maps the *cache-size* knee, not fetch speed: sequential code that overflows the cache misses at a constant per-word rate however far it overflows, so a bigger body is the same CPI, just longer. Park it for when we evaluate growing the cache.
+
 ### Layer 2 — Application programs
 
-One representative kernel per archetype the other teams will plausibly submit. The **core 6** (implemented in `benchmarks.c`) span the main mix axes; the rest are planned to extend breadth.
+One representative kernel per archetype the other teams will plausibly submit, all implemented in `benchmarks.c`. The **core 6** span the main mix axes; the last four extend breadth — notably `bench_interp`, the one kernel large/jumpy enough to miss the I-cache (so the scored geomean can see the fetch lever and CRM).
 
 | Archetype | Benchmark | Kernel | Character |
 | --- | --- | --- | --- |
@@ -149,9 +155,10 @@ One representative kernel per archetype the other teams will plausibly submit. T
 | Number theory | `bench_prime_count` | count primes ≤ N by trial division | div/mod + branch |
 | DSP / filtering | `bench_fir` | fixed-point 16-tap FIR over a signal | mul-acc + shift + streaming loads |
 | Text | `bench_strsearch` | naive substring search over text | byte loads + branches |
-| Simulation | `game_of_life` *(planned)* | Conway, K generations on a grid | 2-D stencil, branch, memory |
-| Recursion | `fib_rec` *(planned)* | recursive Fibonacci(n) | call/return + stack ld/st |
-| RNG / Monte-Carlo | `xorshift_mc` *(planned)* | PRNG → fixed-point π estimate | shift/xor + compare + mul |
+| Interpreter / VM | `bench_interp` | bytecode dispatch: data-dependent `switch` over 32 ops, handler code > cache | non-sequential fetch; **the one kernel that misses the I-cache**, making the geomean sensitive to fast-read + CRM |
+| Simulation | `bench_game_of_life` | Conway, K generations on a grid | 2-D stencil, branch, memory |
+| Recursion | `bench_fib_rec` | recursive Fibonacci(n) | call/return + stack ld/st |
+| RNG / Monte-Carlo | `bench_xorshift_mc` | PRNG → fixed-point π estimate | shift/xor + compare + mul |
 
 ### Results
 
@@ -240,14 +247,14 @@ Until fetch is cheap, the other two levers are *invisible*: core-CPI and clock w
   - radix-4 divider
   - full 5-stage pipeline (`CPI_core` → ~1)
 - **Clock `T_c`:**
-  - PLL ✅ at 17.625 MHz, already maxed against the ~18.5 MHz logic critical path.
+  - PLL ✅ (currently ~18.4 MHz), already maxed against the ~18.5 MHz logic critical path.
   - Going higher needs the path *shortened* first (`TWO_CYCLE_ALU`/retiming)
 
 The PLL is gated on the critical path. But it's the highest-leverage lever once unlocked (~2.8× at 50 MHz, speeds even fetch-bound code), so critical-path work (`TWO_CYCLE_ALU`, pipelining) pulls double duty: lower core CPI *and* a higher clock.
 
 | Optimisation | Lever | Effort | Reward | Risk | Done |
 | --- | --- | --- | --- | --- | :---: |
-| PLL (12 → 17.6 MHz) | $T_c$ | low | high | low | ✅ |
+| PLL (12 → ~18.4 MHz) | $T_c$ | low | high | low | ✅ |
 | `COMPRESSED_ISA=0` | $T_c$ | low | high | low | ✅ |
 | `TWO_CYCLE_ALU/COMPARE` + retiming | $T_c$ | low | cond. combine w/higher clock.| low | ❌ |
 | Flash fast-read (Dual/Quad/DDR + CRM) | fetch | low | high | low–med | ❌ |
@@ -263,9 +270,49 @@ The cheapest fetch win: `spimemio` already supports Dual/Quad/DDR + CRM but powe
 
 The example firmware's `boot()` sets the *flash chip's* QE bit but never switches the *controller* into a fast mode — and cross-evaluation firmware may not touch it at all. So the fix must be in `spimemio`'s **hardware reset defaults** (`config_qspi`/`config_ddr`/`config_cont`/`config_dummy`), guaranteeing fast fetch for any firmware. Three routes, increasing speed and cost:
 
-- **Dual-I/O (`0xBB`)** — uses two data lines, needs **no flash configuration bit**, near-zero logic, roughly halves the transfer.
-- **Quad-I/O (`0xEB`)** — needs a small reset-time boot FSM to set the flash QE bit (`WREN`+`WRSR`) before the first fetch; unlocks the full ~3.5× speedup.
-- **Quad DDR (`0xED`)** — fastest (clocks data on both edges); the DDR datapath already exists in `spimemio`, so the only cost is DDR I/O timing closure.
+- **Dual-I/O (`0xBB`)** — two lanes, **no flash QE bit needed** → ~2×, near-zero logic. The safe first step.
+- **Quad-I/O (`0xEB`)** — four lanes → ~3.5×, but the flash QE bit must be set first (Rollout step 2).
+- **Quad DDR (`0xED`)** — clocks data on both edges → fastest, but adds DDR I/O timing closure (Rollout step 3).
+
+#### Mode encoding (how the bits map)
+
+Two orthogonal axes set the speed: **lanes** (how many IO wires carry data) and **rate** (SDR = data on the rising SCK edge only; DDR = both edges). `INIT_MODE` picks a point in that grid, which `spimemio` decodes into the `{config_ddr, config_qspi}` cfgreg bits and the read command:
+
+| `INIT_MODE` | `{ddr,qspi}` | cmd | lanes × rate | dummy | bits/SCK | SPI-state print |
+| ---: | :---: | :---: | :--- | ---: | ---: | :--- |
+| 0 single | `00` | `0x03` | 1 × SDR | 8 (unused) | 1 | DDR off, QSPI off |
+| 1 dual | `10` | `0xBB` | 2 × SDR | 0 | 2 | **DDR on**, QSPI off |
+| 2 quad | `01` | `0xEB` | 4 × SDR | 4 | 4 | DDR off, QSPI on |
+| 3 qddr | `11` | `0xED` | 4 × DDR | 7 | 8 | DDR on, QSPI on |
+
+- **Naming trap — `config_ddr` is *not* "double-data-rate".** It's cfgreg bit 22, really *mode-select bit 1*: set for **dual** (a 2-lane **SDR** mode) as well as for qddr. That's why `cmd_print_spi_state` reads "DDR on" for dual — true double-rate is *only* `{11}` qddr (`0xED`); dual is 2 lanes at single rate, nothing to do with clock edges. (In `spimemio.v`: `xfer_dspi = ddr & !qspi` is the dual-SDR path; `xfer_ddr = ddr & qspi` is the only true-DDR path.)
+- **CRM is a separate switch** (cfgreg bit 20 / `config_cont` / `INIT_CRM`): it drops the 8-clock command byte on each *non-sequential* refetch by sending mode byte `0xA5` instead of `0xFF`. Orthogonal to `INIT_MODE` — it layers on dual/quad/qddr (single sends no mode byte, so CRM doesn't apply).
+- **Measuring per-mode on the board:** `boot()` sets the flash QE bit first, so you can switch live via the firmware menu (`[3]`–`[7]`) and run `[T]`/`[B]` under each mode — even quad/qddr work, because QE is already set when you flip the controller. The QE-init FSM (rollout step 2 below) is needed *only* to make quad safe as the firmware-independent **reset default**, not to measure it.
+
+#### Implementation plan: one top-level knob
+
+Rather than hand-edit `spimemio.v` per experiment, parameterise its reset defaults *once* and drive everything from a single mode knob at the top level (same pattern as `ENABLE_ICACHE`):
+
+- **`spimemio.v`** (touched once): add params `INIT_MODE` (2-bit: `0`=single / `1`=dual / `2`=quad / `3`=qddr) and `INIT_CRM`. The `!resetn` block derives `{config_ddr, config_qspi, config_dummy}` from `INIT_MODE` via a `case`, and `config_cont <= INIT_CRM`. Defaults `INIT_MODE=0, INIT_CRM=0` reproduce today's single-SPI exactly — a no-op until flipped.
+- **`picosoc.v`**: add pass-through params `FLASH_INIT_MODE` / `FLASH_INIT_CRM`, wired to the `spimemio` instance.
+- **`icebreaker.v`**: set `FLASH_INIT_MODE` / `FLASH_INIT_CRM` on the `picosoc` instance — the only line touched per experiment.
+
+A single `INIT_MODE` enum (not four raw bits) is deliberate: `config_dummy` **must** match the command (`0xBB`→0, `0xEB`→4, `0xED`→7) or the data phase mis-aligns and fetches garbage. The enum derives the correct dummy internally, so an illegal combo is unrepresentable. (Dummy values are lifted from the known-good firmware `set_flash_mode_*` setters.)
+
+#### Rollout (staged by risk)
+
+1. **Dual (`FLASH_INIT_MODE=1`) — first.** Firmware-independent, **no QE bit needed** (uses IO0/IO1, the always-on data pins), ~2× transfer, near-zero logic. The safe baseline win.
+2. **Quad (`FLASH_INIT_MODE=2`) — needs a QE-init FSM.** `0xEB`/`0xED` use IO2/IO3, which on the W25Q128JV default to `/WP` and `/HOLD`; they only become data lines when the flash's **QE bit (SR2 bit 1, S9)** is set — and that bit lives *inside the flash*, not the FPGA, so the read command alone can't enable it. The eval firmware won't set it, so extend `spimemio`'s reset init chain (currently `0xFF`→`0xAB`) to also issue `0x50` (write-enable volatile) + `0x31` (WRSR2, QE=1), each CS-framed, before the first read. Volatile = instant, no flash-endurance wear, re-applied every reset → works for any firmware.
+3. **Quad DDR (`FLASH_INIT_MODE=3`) — last.** Same QE requirement *plus* DDR I/O timing closure (the negedge `xfer_io*_90` path).
+
+**Verify each step:** `make icebsim` (the `spiflash.v` model handles `0xBB`/`0xEB`/`0xED`), confirm the 45 `tests/*.S` still pass, then measure `bench_cold` / fetch CPI via `run_flashmodes` / `run_scope`.
+
+#### Sim model (`spiflash.v`) gotchas
+
+The sim flash model has to agree with the controller on **two** things per mode, or `icebsim` lies:
+
+1. **Dummy cycles must match `config_dummy`.** After the address+mode byte, the model tristates the bus for its dummy count while the controller starts clocking for *data* on its own `config_dummy` schedule. If they differ, the controller samples `Z`→`x` and latches a misaligned/garbage word. So the model's per-command dummy must equal the controller's: `0xBB`→**0**, `0xEB`→**4**, `0xED`→**7**. The stock model hardcoded a generic `latency`=8 for *all* fast-read commands — wrong for every one of ours. **Fixed for `0xBB`** (`dummycount = 0`, since the M7–M0 mode byte *is* the turnaround on the W25Q128JV — no separate dummy clocks). **`0xEB`/`0xED` still use `latency`=8** and must drop to 4/7 before quad/qddr sim is trustworthy.
+2. **The model does *not* model the QE bit.** It ignores the `0x35`/`0x31`/`0x50`/`0x06` register sequence and answers `0xEB`/`0xED` regardless of QE state. So quad "works" in sim without ever setting QE — meaning **sim cannot validate the QE-init FSM** (rollout step 2); only the board can. A green `icebsim` for quad is *not* proof the QE sequence is right.
 
 **Deeper prefetch (line buffer).** `spimemio`'s streamer keeps sequential reads cheap but restarts the full command+address phase on *every* non-sequential fetch, so each taken branch/call/return pays the worst-case latency. A small fully-associative line buffer (a few recently-fetched lines) inside `spimemio` absorbs short backward branches — a partial, few-LC substitute for the CPU-side cache below.
 
@@ -348,7 +395,7 @@ mem_rdata = priority-mux in the same order
   \node[blk, fill=red!6, minimum width=2.0cm, minimum height=3.8cm] (adec) at (4.0, 0.95) {Address\\Decode};
   \draw[arr] (cpu.east) -- (adec.west) node[midway, above, lbl] {\texttt{mem\_*}};
   \node[blk, fill=blue!22] (spram)  at (8.0, 2.6) {SPRAM\\128\,KB};
-  \node[blk, fill=blue!16]  (flash)  at (8.0, 1.5) {spimemio\\SPI Flash};
+  \node[blk, fill=blue!16]  (flash)  at (8.0, 1.5) {spimemio};
   \node[blk, fill=yellow!12](spicfg) at (8.0, 0.5) {UART};
   \node[blk, fill=gray!15, minimum width=2.2cm] (iomem) at (8.0, -0.7) {iomem bus / GPIO};
   \draw[arr] (adec.east |- spram)  -- (spram.west)  node[midway, flbl] {\texttt{< 0x00020000}};
@@ -367,7 +414,7 @@ mem_rdata = priority-mux in the same order
     \draw[thick, blue!50] ([xshift=\xoff cm]\nd.south) -- ([xshift=\xoff cm]\nd.south |- 0,-2.4);
   }
   \end{scope}
-  \node[draw, rounded corners=2pt, fill=gray!8, font=\sffamily\tiny, inner sep=3pt, align=center] (bflash) at (11.5, 1.5) {W25Q128\\Flash};
+  \node[draw, rounded corners=2pt, fill=gray!8, font=\sffamily\tiny, inner sep=3pt, align=center] (bflash) at (11.5, 1.5) {W25Q128\\SPI Flash};
   \node[draw, rounded corners=2pt, fill=gray!8, font=\sffamily\tiny, inner sep=3pt, align=center] (buart) at (11.5, 0.5) {FT2232H\\UART};
   \draw[arr, gray] (flash.east) -- (bflash.west) node[midway, above, lbl] {QSPI};
   \draw[arr, gray] (spicfg.east) -- (buart.west) node[midway, above, lbl] {TX/RX};
@@ -381,54 +428,90 @@ mem_rdata = priority-mux in the same order
 \documentclass[tikz,border=8pt]{standalone}
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta, positioning, fit, backgrounds}
+
 \begin{document}
+
 \begin{tikzpicture}[>=Stealth, semithick, scale=0.78, every node/.style={transform shape},
   blk/.style={draw, rounded corners=2pt, minimum height=0.8cm,
               minimum width=2.0cm, font=\sffamily\scriptsize, align=center},
   arr/.style={->, thick},
   lbl/.style={font=\sffamily\tiny},
   flbl/.style={font=\sffamily\tiny, fill=white, inner sep=1pt}]
+
   \begin{scope}[on background layer]
-  \fill[green!4, rounded corners=6pt] (-2.6, -3.4) rectangle (14.8, 4.0);
-  \draw[green!40!black!30, thick, rounded corners=6pt] (-2.6, -3.4) rectangle (14.8, 4.0);
-  \node[font=\sffamily\scriptsize\bfseries, green!40!black] at (6.0, 3.75) {icebreaker.v};
-  \fill[blue!5, rounded corners=4pt] (-2.2, -3.0) rectangle (11.0, 3.4);
-  \draw[blue!40, thick, rounded corners=4pt] (-2.2, -3.0) rectangle (11.0, 3.4);
-  \node[font=\sffamily\scriptsize\bfseries, blue!50!black] at (-0.9, 3.15) {picosoc.v};
+    \fill[green!4, rounded corners=6pt] (-2.6, -3.4) rectangle (14.8, 4.0);
+    \draw[green!40!black!30, thick, rounded corners=6pt] (-2.6, -3.4) rectangle (14.8, 4.0);
+    \node[font=\sffamily\scriptsize\bfseries, green!40!black] at (6.0, 3.75) {icebreaker.v};
+
+    \fill[blue!5, rounded corners=4pt] (-2.2, -3.0) rectangle (11.0, 3.4);
+    \draw[blue!40, thick, rounded corners=4pt] (-2.2, -3.0) rectangle (11.0, 3.4);
+    \node[font=\sffamily\scriptsize\bfseries, blue!50!black] at (-0.9, 3.15) {picosoc.v};
   \end{scope}
+
   \node[blk, fill=blue!20, minimum height=1.6cm, minimum width=2.4cm] (cpu) at (0, 0.5) {};
   \node[font=\sffamily\scriptsize, align=center] at (0, 0.92) {picorv32\\CPU};
-  \node[blk, fill=blue!35, minimum height=0.5cm, minimum width=1.9cm, font=\sffamily\tiny] (rf) at (0, 0.08) {register file (4$\times$ EBR)};
-  \node[blk, fill=red!6, minimum width=1.7cm, minimum height=4.4cm] (adec) at (3.4, 0.5) {Address\\Decode};
-  \draw[arr] (cpu.east) -- (adec.west) node[midway, above, lbl] {\texttt{mem\_*}};
+
+  \node[blk, fill=blue!35, minimum height=0.5cm, minimum width=1.9cm,
+        font=\sffamily\tiny] (rf) at (0, 0.08) {register file (4$\times$ EBR)};
+
+  \node[blk, fill=red!6, minimum width=1.7cm, minimum height=4.4cm]
+        (adec) at (3.4, 0.5) {Address\\Decode};
+
+  \draw[arr] (cpu.east) -- (adec.west)
+    node[midway, above, lbl] {\texttt{mem\_*}};
+
   \node[blk, fill=green!18, minimum height=1.0cm, minimum width=1.9cm,
-        draw=green!50!black, thick, dashed] (cache) at (6.5, 2.4) {Instr Cache\\{\tiny 256$\times$32 EBR}};
+        draw=green!50!black, thick, dashed]
+        (cache) at (6.5, 2.4) {Instr Cache\\{\tiny 256$\times$32 EBR}};
+
   \node[blk, fill=blue!16]  (flash)  at (9.6, 2.4) {spimemio\\SPI Flash};
   \node[blk, fill=blue!22]  (spram)  at (9.6, 1.0) {SPRAM\\128\,KB};
-  \node[blk, fill=yellow!12](spicfg) at (9.6, -0.3){SPI cfg / UART};
+  \node[blk, fill=yellow!12](spicfg) at (9.6, -0.3) {SPI cfg / UART};
   \node[blk, fill=gray!15, minimum width=2.2cm] (iomem) at (9.6, -1.5) {iomem bus};
+
   \draw[arr, green!50!black] (adec.east |- cache) -- (cache.west)
-    node[midway, flbl, text=green!50!black] {\texttt{0x20000..0x1FFFFFF}};
-  \draw[arr] (cache.east) -- (flash.west) node[midway, above, lbl] {miss \texttt{(spi\_*)}};
-  \draw[arr] (adec.east |- spram)  -- (spram.west)  node[midway, flbl] {\texttt{< 0x20000}};
-  \draw[arr] (adec.east |- spicfg) -- (spicfg.west) node[midway, flbl] {\texttt{0x0200\_000x}};
-  \draw[arr] (adec.east |- iomem)  -- (iomem.west)  node[midway, flbl] {\texttt{[31:24]>0x01}};
+    node[pos=0.97, below left=2pt and 2pt, flbl, text=green!50!black, align=center]
+    {\texttt{0x0002\_0000..}\\\texttt{0x01FF\_FFFF}};
+
+  \draw[arr] (cache.east) -- (flash.west)
+    node[midway, above, lbl] {miss \texttt{(spi\_*)}};
+
+  \draw[arr] (adec.east |- spram) -- (spram.west)
+    node[midway, flbl] {\texttt{< 0x20000}};
+
+  \draw[arr] (adec.east |- spicfg) -- (spicfg.west)
+    node[midway, flbl] {\texttt{0x0200\_000x}};
+
+  \draw[arr] (adec.east |- iomem) -- (iomem.west)
+    node[midway, flbl] {\texttt{[31:24]>0x01}};
+
   \node[blk, fill=gray!15, minimum width=1.4cm] (gpio) at (13.0, -1.1) {LEDs};
   \node[blk, fill=gray!15, minimum width=1.4cm] (sevs) at (13.0, -2.2) {7-seg};
-  \draw[arr] (iomem.east) -- ++(0.4,0) coordinate (iofan);
-  \draw[arr] (iofan) |- (gpio.west) node[pos=0.25, above, lbl] {\texttt{0x03..}};
+
+  \draw[arr] (iomem.east) -- ++(0.4, 0) coordinate (iofan);
+  \draw[arr] (iofan) |- (gpio.west)
+    node[pos=0.25, above, lbl] {\texttt{0x03..}};
   \draw[arr] (iofan) |- (sevs.west);
+
   \begin{scope}[on background layer]
-  \draw[<-, thick, blue!50] (cpu.south) -- (0, -2.6) -- (10.3, -2.6)
-    node[pos=0.5, below, flbl, text=blue!50] {\texttt{mem\_ready / mem\_rdata}};
-  \foreach \nd/\xoff in {cache/0, spram/-0.2, spicfg/0, iomem/0.2} {
-    \draw[thick, blue!50] ([xshift=\xoff cm]\nd.south) -- ([xshift=\xoff cm]\nd.south |- 0,-2.6);
-  }
+    \draw[<-, thick, blue!50] (cpu.south) -- (0, -2.6) -- (10.3, -2.6)
+      node[pos=0.5, below, flbl, text=blue!50] {\texttt{mem\_ready / mem\_rdata}};
+
+    \foreach \nd/\xoff in {cache/0, spram/-0.2, spicfg/0, iomem/0.2} {
+      \draw[thick, blue!50]
+        ([xshift=\xoff cm]\nd.south) -- ([xshift=\xoff cm]\nd.south |- 0,-2.6);
+    }
   \end{scope}
-  \node[draw, rounded corners=2pt, fill=gray!8, font=\sffamily\tiny, inner sep=3pt, align=center]
-    (bflash) at (12.7, 2.4) {W25Q128\\Flash};
-  \draw[arr, gray] (flash.east) -- (bflash.west) node[midway, above, lbl] {QSPI};
+
+  \node[draw, rounded corners=2pt, fill=gray!8, font=\sffamily\tiny,
+        inner sep=3pt, align=center]
+        (bflash) at (12.7, 2.4) {W25Q128\\Flash};
+
+  \draw[arr, gray] (flash.east) -- (bflash.west)
+    node[midway, above, lbl] {QSPI};
+
 \end{tikzpicture}
+
 \end{document}
 ```
 
@@ -602,7 +685,7 @@ Smaller wins within the repo
 
 `BARREL_SHIFTER=1` shifts finish combinationally (3 cyc) instead of iterating (up to ~14). ~200 LCs. Also a **prerequisite for pipelining** (a fixed-latency Execute stage can't tolerate the shift loop).
 
-Effects are only noticeable with `ENABLE_ICACHE`:
+Effects are only noticeable with `ENABLE_ICACHE=1` (and `BARREL_SHIFTER=1`):
 ```
 benchmark (cycles  instrs  CPI  checksum)
 -- Compute --
@@ -654,7 +737,7 @@ Needs separate instruction/data paths (cache + SPRAM, distinguished by `mem_inst
 
 #### PLL
 
-The board only supplies a raw **12 MHz** crystal on the clock pad. The iCE40's hard **PLL** (`SB_PLL40_PAD`) multiplies that reference up to a faster system clock. Currently set to **17.625 MHz** — the current design's $f_{max}$. Refer to the `SB_PLL40_PAD` code block in `icebreaker.v`:
+The board only supplies a raw **12 MHz** crystal on the clock pad. The iCE40's hard **PLL** (`SB_PLL40_PAD`) multiplies that reference up to a faster system clock — currently **18.375 MHz**, right at the design's $f_{max}$. We retune this often, so the live value lives in `DIVF` (`icebreaker.v`) and `F_CLK_HZ` (`benchmarks.h`), not in this prose. Refer to the `SB_PLL40_PAD` code block in `icebreaker.v`:
 
 ```verilog
 module icebreaker (
@@ -668,7 +751,7 @@ wire pll_locked;
 SB_PLL40_PAD #(
     .FEEDBACK_PATH("SIMPLE"),
     .DIVR(4'b0000),       // = 0
-    .DIVF(7'b0101110),    // = 46
+    .DIVF(7'b0110000),    // = 48
     .DIVQ(3'b101),        // = 5
     .FILTER_RANGE(3'b001)
 ) pll (
@@ -683,7 +766,7 @@ SB_PLL40_PAD #(
 **The frequency** is set by three dividers (run `icepll -i 12 -o <ideal_freq>` to get valid values for a new target):
 
 $$
-f_{out} = f_{ref}\,\frac{DIVF+1}{(DIVR+1)\,2^{DIVQ}} = 12\,\frac{47}{32} = 17.625\text{ MHz}
+f_{out} = f_{ref}\,\frac{DIVF+1}{(DIVR+1)\,2^{DIVQ}} = 12\,\frac{49}{32} = 18.375\text{ MHz}
 $$
 
 Physical constraints bound our divider values: the **VCO** ($f_{ref}\frac{DIVF+1}{DIVR+1}$) must stay in **533–1066 MHz**, the phase-detector input ≥ 10 MHz, and the **PLL output floor is 16 MHz**. Lock takes ≤ 50 µs (the reason for the reset-until-`pll_locked` gate).
@@ -719,14 +802,14 @@ The achievable clock is the **minimum** of several independent limits:
 - check `icebreaker.rpt` (icetime): `Total path delay: 54.18 ns (18.46 MHz)`
 - nextpnr (print to terminal after synth) also prints `Max frequency for clock ...: 19.94 MHz (PASS at 18.38 MHz)` to stdout.
 
-**Currently this is at 18.5Hz**, bottlenecked by critical path.
+**We currently run at ~18.4 MHz, right against the ~18.5 MHz critical-path ceiling** (so the clock is fully limited by the path below, not the PLL).
 - **Shorten the critical path** (`TWO_CYCLE_ALU`/`TWO_CYCLE_COMPARE` + retiming), decrease our critical path until its no longer the bottleneck to increase clock speed further. Then next bottleneck is DSP 50MHz.
 
 The payoff is large because the PLL speeds *everything* linearly in wall-clock (including flash, since SCK = clk/2). But it's **gated on critical-path work**, which is why the cache (works today) comes first and `T_c` tweaks are enablers.
 
 ##### Critical Path
 
-The actual critical path (`icebreaker.rpt`, post-route at 16.875 MHz):
+The actual critical path (`icebreaker.rpt`, post-route):
 
 ```text
 mem_addr (DFF) → iomem_addr → iomem_ready (mem_ready decode mux) → flash_io3_di

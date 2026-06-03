@@ -61,20 +61,11 @@ extern uint32_t sram;
 extern uint32_t flashio_worker_begin;
 extern uint32_t flashio_worker_end;
 
-// Run a raw SPI command against the flash via spimemio's manual bit-bang mode
-// (cfgreg config_en=0) -- for chip-config ops that MEMIO reads can't do: read/write
-// status registers (the QE bit), read flash ID. Half-duplex and in-place: `data` is
-// clocked out and the reply overwrites it byte-for-byte; `len` = byte count; `wrencmd`
-// is an optional write-enable opcode (e.g. 0x06 / 0x50) sent CS-framed first, or 0 for none.
-//
-// Why it copies code into a local array first: the real bit-bang routine is `flashio_worker`
-// in start.s (bracketed by the flashio_worker_begin/end linker symbols). It seizes the flash
-// pins (manual mode), so while it runs the CPU CANNOT fetch instructions from flash -- it
-// therefore can't execute in place from flash. So we copy it onto the stack (which lives in
-// 1-cycle SPRAM, not flash) and call it there.
+// Bit-bang a raw SPI command to the flash chip (read/write status regs, flash ID) -- things
+// the normal read path can't do. The worker (start.s) takes over the flash pins, so the CPU
+// can't fetch from flash while it runs; we copy it into SRAM (func) and call it there.
 void flashio(uint8_t *data, int len, uint8_t wrencmd)
 {
-	// VLA sized to the worker's word count; copy the worker (flash) -> func (SPRAM)
 	uint32_t func[&flashio_worker_end - &flashio_worker_begin];
 
 	uint32_t *src_ptr = &flashio_worker_begin;
@@ -83,7 +74,6 @@ void flashio(uint8_t *data, int len, uint8_t wrencmd)
 	while (src_ptr != &flashio_worker_end)
 		*(dst_ptr++) = *(src_ptr++);
 
-	// call the SRAM-resident copy: void worker(uint8_t *data, uint32_t len, uint32_t wrencmd)
 	((void(*)(uint8_t*, uint32_t, uint32_t))func)(data, len, wrencmd);
 }
 

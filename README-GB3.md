@@ -268,15 +268,16 @@ The PLL is gated on the critical path. But it's the highest-leverage lever once 
 
 The cheapest fetch win: `spimemio` already supports Dual/Quad/DDR + CRM but powers up in the slowest single-bit mode and never leaves it, so a word costs ~64 SPI clocks instead of ~20 (Quad+CRM) or ~8 (sustained sequential address fetches).
 
-The example firmware's `boot()` sets the *flash chip's* QE bit but never switches the *controller* into a fast mode — and cross-evaluation firmware may not touch it at all. So the fix must be in `spimemio`'s **hardware reset defaults** (`config_qspi`/`config_ddr`/`config_cont`/`config_dummy`), guaranteeing fast fetch for any firmware. Three routes, increasing speed and cost:
+The example firmware's `boot()` sets the *flash chip's* QE bit but never switches the `spimemio` *controller* into a fast mode — and cross-evaluation firmware may not touch it at all. So the fix must be in `spimemio`'s **hardware reset defaults** (`config_qspi`/`config_ddr`/`config_cont`/`config_dummy`), guaranteeing fast fetch for **any** firmware. The 4 config modes are
 
-- **Dual-I/O (`0xBB`)** — two lanes, **no flash QE bit needed** → ~2×, near-zero logic. The safe first step.
+- **Single-bit (`0x03`)** — one lane → 1×, the slow power-up default
+- **Dual-I/O (`0xBB`)** — two lanes, no flash QE bit needed → ~2×, near-zero logic
 - **Quad-I/O (`0xEB`)** — four lanes → ~3.5×, but the flash QE bit must be set first (Rollout step 2).
 - **Quad DDR (`0xED`)** — clocks data on both edges → fastest, but adds DDR I/O timing closure (Rollout step 3).
 
 #### Mode encoding (how the bits map)
 
-Two orthogonal axes set the speed: **lanes** (how many IO wires carry data) and **rate** (SDR = data on the rising SCK edge only; DDR = both edges). `INIT_MODE` picks a point in that grid, which `spimemio` decodes into the `{config_ddr, config_qspi}` cfgreg bits and the read command:
+Two things set the speed: **lanes** (how many IO wires carry data) and **rate** (SDR = data on the rising SCK edge only; DDR = both edges). `INIT_MODE` picks a point in that grid, which `spimemio` decodes into the `{config_ddr, config_qspi}` cfgreg bits and the read command:
 
 | `INIT_MODE` | `{ddr,qspi}` | cmd | lanes × rate | dummy | bits/SCK | SPI-state print |
 | ---: | :---: | :---: | :--- | ---: | ---: | :--- |
@@ -285,24 +286,41 @@ Two orthogonal axes set the speed: **lanes** (how many IO wires carry data) and 
 | 2 quad | `01` | `0xEB` | 4 × SDR | 4 | 4 | DDR off, QSPI on |
 | 3 qddr | `11` | `0xED` | 4 × DDR | 7 | 8 | DDR on, QSPI on |
 
-- **Naming trap — `config_ddr` is *not* "double-data-rate".** It's cfgreg bit 22, really *mode-select bit 1*: set for **dual** (a 2-lane **SDR** mode) as well as for qddr. That's why `cmd_print_spi_state` reads "DDR on" for dual — true double-rate is *only* `{11}` qddr (`0xED`); dual is 2 lanes at single rate, nothing to do with clock edges. (In `spimemio.v`: `xfer_dspi = ddr & !qspi` is the dual-SDR path; `xfer_ddr = ddr & qspi` is the only true-DDR path.)
-- **CRM is a separate switch** (cfgreg bit 20 / `config_cont` / `INIT_CRM`): it drops the 8-clock command byte on each *non-sequential* refetch by sending mode byte `0xA5` instead of `0xFF`. Orthogonal to `INIT_MODE` — it layers on dual/quad/qddr (single sends no mode byte, so CRM doesn't apply).
-- **Measuring per-mode on the board:** `boot()` sets the flash QE bit first, so you can switch live via the firmware menu (`[3]`–`[7]`) and run `[T]`/`[B]` under each mode — even quad/qddr work, because QE is already set when you flip the controller. The QE-init FSM (rollout step 2 below) is needed *only* to make quad safe as the firmware-independent **reset default**, not to measure it.
+- **Naming trap — `config_ddr` is *not* "double-data-rate".**
+  - It's cfgreg bit 22, really *mode-select bit 1*
+  - That's why `cmd_print_spi_state` reads "DDR on" for dual — true double-rate is *only* `{11}` qddr (`0xED`)
+  - dual is 2 lanes at single rate, nothing to do with clock edges.
+  - In `spimemio.v`: `xfer_dspi = ddr & !qspi` is the dual-SDR path; `xfer_ddr = ddr & qspi` is the only true-DDR path.
+- **TOO COMPLICATED - CRM is a separate switch** (cfgreg bit 20 / `config_cont` / `INIT_CRM`)
+  - it drops the 8-clock command byte on each *non-sequential* refetch by sending mode byte `0xA5` instead of `0xFF`.
+  - **Only works with dual/quad/qddr** (single sends no mode byte, so CRM doesn't apply).
+  - *ran into many problems implementing this in hardware so we leave this for now*
+- **Measuring per-mode on the board:**
+  - `boot()` sets the flash QE bit first via `set_flash_qspi_flag()`, so you can switch live via the firmware menu (`[3]`–`[7]`) and run `[T]`/`[B]` under each mode
+  - The QE-init FSM (rollout step 2 below) is needed *only* to make quad safe as the firmware-independent **reset default**, not to measure it.
 
 #### Implementation plan: one top-level knob
 
 Rather than hand-edit `spimemio.v` per experiment, parameterise its reset defaults *once* and drive everything from a single mode knob at the top level (same pattern as `ENABLE_ICACHE`):
 
-- **`spimemio.v`** (touched once): add params `INIT_MODE` (2-bit: `0`=single / `1`=dual / `2`=quad / `3`=qddr) and `INIT_CRM`. The `!resetn` block derives `{config_ddr, config_qspi, config_dummy}` from `INIT_MODE` via a `case`, and `config_cont <= INIT_CRM`. Defaults `INIT_MODE=0, INIT_CRM=0` reproduce today's single-SPI exactly — a no-op until flipped.
-- **`picosoc.v`**: add pass-through params `FLASH_INIT_MODE` / `FLASH_INIT_CRM`, wired to the `spimemio` instance.
-- **`icebreaker.v`**: set `FLASH_INIT_MODE` / `FLASH_INIT_CRM` on the `picosoc` instance — the only line touched per experiment.
+- **`spimemio.v`**:
+  - add params `INIT_MODE` (2-bit: `0`=single / `1`=dual / `2`=quad / `3`=qddr) and `INIT_CRM`.
+  - The `!resetn` block derives `{config_ddr, config_qspi, config_dummy}` from `INIT_MODE` via a `case`, and `config_cont <= INIT_CRM`.
+  - Defaults `INIT_MODE=0, INIT_CRM=0` reproduce today's single-SPI exactly — a no-op until flipped.
+- **`picosoc.v`**:
+  - add pass-through params `FLASH_INIT_MODE` / `FLASH_INIT_CRM`, wired to the `spimemio` instance.
+- **`icebreaker.v`**:
+  - set `FLASH_INIT_MODE` / `FLASH_INIT_CRM` on the `picosoc` instance — the only line touched per experiment.
 
 A single `INIT_MODE` enum (not four raw bits) is deliberate: `config_dummy` **must** match the command (`0xBB`→0, `0xEB`→4, `0xED`→7) or the data phase mis-aligns and fetches garbage. The enum derives the correct dummy internally, so an illegal combo is unrepresentable. (Dummy values are lifted from the known-good firmware `set_flash_mode_*` setters.)
 
 #### Rollout (staged by risk)
 
-1. **Dual (`FLASH_INIT_MODE=1`) — first.** Firmware-independent, **no QE bit needed** (uses IO0/IO1, the always-on data pins), ~2× transfer, near-zero logic. The safe baseline win.
-2. **Quad (`FLASH_INIT_MODE=2`) — needs a QE-init FSM.** `0xEB`/`0xED` use IO2/IO3, which on the W25Q128JV default to `/WP` and `/HOLD`; they only become data lines when the flash's **QE bit (SR2 bit 1, S9)** is set — and that bit lives *inside the flash*, not the FPGA, so the read command alone can't enable it. The eval firmware won't set it, so extend `spimemio`'s reset init chain (currently `0xFF`→`0xAB`) to also issue `0x50` (write-enable volatile) + `0x31` (WRSR2, QE=1), each CS-framed, before the first read. Volatile = instant, no flash-endurance wear, re-applied every reset → works for any firmware.
+1. **Dual (`FLASH_INIT_MODE=1`) — first.**
+   1. Firmware-independent, **no QE bit needed** (uses IO0/IO1, the always-on data pins), ~2× transfer, near-zero logic. The safe baseline win.
+2. **Quad (`FLASH_INIT_MODE=2`) — needs a QE-init FSM.**
+   1. `0xEB`/`0xED` use IO2/IO3, which on the W25Q128JV default to `/WP` and `/HOLD`; they only become data lines when the flash's **QE bit (SR2 bit 1, S9)** is set — and that bit lives *inside the flash*, not the FPGA, so the read command alone can't enable it.
+> **Why an FSM and not firmware:** software *can* set QE (that's `set_flash_qspi_flag()` in `boot()`, which is how the live menu measures quad) — but `boot()` runs *after* the reset-vector fetch, and a quad reset default fetches that first instruction in quad mode before any firmware executes. Too late. So the controller has to set QE itself: extend `spimemio`'s reset init chain (currently `0xFF`→`0xAB`) to also issue `0x50` (write-enable volatile) + `0x31` (WRSR2, QE=1), each CS-framed, before the first read. Volatile = instant, no flash-endurance wear, re-applied every reset → works for any firmware.
 3. **Quad DDR (`FLASH_INIT_MODE=3`) — last.** Same QE requirement *plus* DDR I/O timing closure (the negedge `xfer_io*_90` path).
 
 **Verify each step:** `make icebsim` (the `spiflash.v` model handles `0xBB`/`0xEB`/`0xED`), confirm the 45 `tests/*.S` still pass, then measure `bench_cold` / fetch CPI via `run_flashmodes` / `run_scope`.

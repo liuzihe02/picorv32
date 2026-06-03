@@ -17,7 +17,9 @@
  *
  */
 
-module spimemio (
+module spimemio #(
+	parameter [1:0] INIT_MODE = 0   // reset read-mode: 0=single(0x03) 1=dual(0xBB) 2=quad(0xEB) 3=qddr(0xED)
+) (
 	input clk, resetn,
 
 	input valid,
@@ -105,10 +107,19 @@ module spimemio (
 			config_clk <= 0;
 			config_oe <= 0;
 			config_do <= 0;
-			config_ddr <= 0;
-			config_qspi <= 0;
-			config_cont <= 0;
-			config_dummy <= 8;
+			// Flash read-mode reset defaults, derived from INIT_MODE (set in icebreaker.v).
+			// config_dummy must match the command or the data phase mis-aligns; values
+			// match the firmware set_flash_mode_* setters. {config_ddr,config_qspi} is
+			// what the state-4 command mux decodes.
+			// NOTE: modes 2/3 (quad/qddr) also require the flash QE bit to be set, which
+			// is NOT done yet -- only modes 0 (single) and 1 (dual) are functional currently
+			config_cont <= 0;   // CRM is software-only (cfgreg bit 20); never a reset default
+			case (INIT_MODE)
+				2'd0: begin config_ddr <= 0; config_qspi <= 0; config_dummy <= 8; end // single 0x03 (dummy unused)
+				2'd1: begin config_ddr <= 1; config_qspi <= 0; config_dummy <= 0; end // dual   0xBB
+				2'd2: begin config_ddr <= 0; config_qspi <= 1; config_dummy <= 4; end // quad   0xEB (needs QE)
+				2'd3: begin config_ddr <= 1; config_qspi <= 1; config_dummy <= 7; end // qddr   0xED (needs QE + DDR timing)
+			endcase
 		end else begin
 			if (cfgreg_we[0]) begin
 				config_csb <= cfgreg_di[5];

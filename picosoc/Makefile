@@ -8,6 +8,20 @@ CROSS=$(RISCV_GNU_TOOLCHAIN_INSTALL_PREFIX)/bin/riscv64-unknown-elf-
 
 CFLAGS=
 
+# ---- Hacky fix: System clock (single source of truth: benchmarks.h F_CLK_HZ) ----
+# sed F_CLK_HZ/BAUD out of benchmarks.h and bridge them to the tools that can't read a C header:
+# the sim tb (-D) and nextpnr/icetime (MHz). Fail loudly if benchmarks.h is missing them
+F_CLK_HZ := $(shell sed -n 's/^#define F_CLK_HZ[[:space:]]*\([0-9]*\).*/\1/p' benchmarks.h)
+BAUD     := $(shell sed -n 's/^#define BAUD[[:space:]]*\([0-9]*\).*/\1/p' benchmarks.h)
+ifeq ($(F_CLK_HZ),)
+$(error F_CLK_HZ not found in benchmarks.h -- expected a line like '#define F_CLK_HZ 17250000u')
+endif
+ifeq ($(BAUD),)
+$(error BAUD not found in benchmarks.h -- expected a line like '#define BAUD 115200u')
+endif
+CLK_DEFS := -DF_CLK_HZ=$(F_CLK_HZ) -DBAUD=$(BAUD)
+CLK_MHZ  := $(shell awk 'BEGIN{printf "%g", $(F_CLK_HZ)/1000000}')
+
 # ---- iCE40 HX8K Breakout Board ----
 
 hx8ksim: hx8kdemo_tb.vvp hx8kdemo_fw.hex
@@ -66,7 +80,7 @@ icebreaker.json: icebreaker.v ice40up5k_spram.v spimemio.v simpleuart.v picosoc.
 	yosys -ql icebreaker.log -p 'synth_ice40 -dsp -top icebreaker -json icebreaker.json' $^
 
 icebreaker_tb.vvp: icebreaker_tb.v icebreaker.v ice40up5k_spram.v spimemio.v simpleuart.v picosoc.v icache.v ../picorv32.v spiflash.v
-	iverilog -DNO_ICE40_DEFAULT_ASSIGNMENTS -s testbench -o $@ $^ `yosys-config --datdir/ice40/cells_sim.v`
+	iverilog -DNO_ICE40_DEFAULT_ASSIGNMENTS -DSIM $(CLK_DEFS) -s testbench -o $@ $^ `yosys-config --datdir/ice40/cells_sim.v`
 
 icebreaker_syn_tb.vvp: icebreaker_tb.v icebreaker_syn.v spiflash.v
 	iverilog -DNO_ICE40_DEFAULT_ASSIGNMENTS -s testbench -o $@ $^ `yosys-config --datdir/ice40/cells_sim.v`
@@ -75,10 +89,10 @@ icebreaker_syn.v: icebreaker.json
 	yosys -p 'read_json icebreaker.json; write_verilog icebreaker_syn.v'
 
 icebreaker.asc: icebreaker.pcf icebreaker.json
-	nextpnr-ice40 --freq 17.625 --up5k --package sg48 --asc icebreaker.asc --pcf icebreaker.pcf --json icebreaker.json
+	nextpnr-ice40 --freq $(CLK_MHZ) --up5k --package sg48 --asc icebreaker.asc --pcf icebreaker.pcf --json icebreaker.json
 
 icebreaker.bin: icebreaker.asc
-	icetime -d up5k -c 17.625 -mtr icebreaker.rpt icebreaker.asc
+	icetime -d up5k -c $(CLK_MHZ) -mtr icebreaker.rpt icebreaker.asc
 	icepack icebreaker.asc icebreaker.bin
 
 icebprog: icebreaker.bin icebreaker_fw.bin

@@ -19,12 +19,29 @@
 
 `timescale 1 ns / 1 ps
 
+// UART timing comes from benchmarks.h's F_CLK_HZ / BAUD, injected via -D by the Makefile
+// (Verilog can't include a C header). The ifndef fallbacks below are only for IDE linting
+// and stray hand-runs. the Makefile fails loudly if benchmarks.h is missing the value.
+`ifndef F_CLK_HZ
+`define F_CLK_HZ 17250000
+`endif
+`ifndef BAUD
+`define BAUD 115200
+`endif
+
 module testbench;
 	reg clk;
 	always #5 clk = (clk === 1'b0);
 
-	localparam ser_half_period = 53;
+	// auto-derived from benchmarks.h via -D (see Makefile); matches the firmware's rounded
+	// reg_uart_clkdiv = (F_CLK_HZ + BAUD/2)/BAUD and simpleuart's bit period -> no manual retune.
+	localparam integer uart_div        = (`F_CLK_HZ + `BAUD/2) / `BAUD;  // = firmware reg_uart_clkdiv
+	localparam integer uart_bit        = uart_div + 1;                   // simpleuart bit period, in clk cycles
+	localparam integer ser_half_period = uart_bit / 2;                  // sample at mid-bit
 	event ser_sample;
+
+	integer uart_bytes = 0;   // serial bytes seen; 0 at $finish => the CPU never ran
+	reg     trap_seen  = 0;   // set by the trap detector below (declared early for the verdict)
 
 	initial begin
 		$dumpfile("testbench.vcd");
@@ -34,6 +51,15 @@ module testbench;
 			repeat (50000) @(posedge clk);
 			$display("+50000 cycles");
 		end
+
+		// self-checking verdict: guards the silent-failure class (no clock / stuck
+		// reset / dead reset-vector fetch) that otherwise looks like a clean run.
+		if (trap_seen)
+			$display("*** SIM FAIL: CPU trapped");
+		else if (uart_bytes == 0)
+			$display("*** SIM FAIL: no UART output -- CPU never ran (clock/reset/PLL-bypass?)");
+		else
+			$display("*** SIM PASS: %0d serial bytes, no trap", uart_bytes);
 		$finish;
 	end
 
@@ -47,7 +73,6 @@ module testbench;
 	// firmware dying; without this it just looks like a silent UART freeze.
 	// The trap line is always on; the per-transfer trace is opt-in: vvp ... +trace
 	reg trace_en;
-	reg trap_seen = 0;
 	initial trace_en = $test$plusargs("trace");
 	always @(posedge clk) begin
 		if (trace_en && uut.soc.mem_valid && uut.soc.mem_ready)
@@ -84,7 +109,7 @@ module testbench;
 		// touching the big arrays mapped outside SPRAM into the flash/cache range.
 		.MEM_WORDS(8192)
 	) uut (
-		.clk      (clk      ),
+		.clk_in   (clk      ),
 		.led1     (led1     ),
 		.led2     (led2     ),
 		.led3     (led3     ),
@@ -130,6 +155,7 @@ module testbench;
 		repeat (ser_half_period) @(posedge clk);
 		-> ser_sample; // stop bit
 
+		uart_bytes = uart_bytes + 1;
 		if (buffer < 32 || buffer >= 127)
 			$display("Serial data: %d", buffer);
 		else
@@ -142,11 +168,11 @@ module testbench;
 	task uart_send(input [7:0] b);
 		integer i;
 		begin
-			ser_rx = 0; repeat (105) @(posedge clk);          // start bit
+			ser_rx = 0; repeat (uart_bit) @(posedge clk);          // start bit
 			for (i = 0; i < 8; i = i + 1) begin
-				ser_rx = b[i]; repeat (105) @(posedge clk);    // data bits, LSB first
+				ser_rx = b[i]; repeat (uart_bit) @(posedge clk);    // data bits, LSB first
 			end
-			ser_rx = 1; repeat (105) @(posedge clk);          // stop bit
+			ser_rx = 1; repeat (uart_bit) @(posedge clk);          // stop bit
 		end
 	endtask
 

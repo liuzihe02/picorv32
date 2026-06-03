@@ -50,10 +50,18 @@ module icebreaker (
 	wire clk;            // system clock, driven by PLL
 	wire pll_locked;
 
+`ifdef SIM
+	// Simulation: yosys cells_sim's SB_PLL40_PAD is an empty stub (drives neither
+	// PLLOUTCORE nor LOCK), so the system clock would never toggle and reset would
+	// never release. Bypass the PLL and run the system clock straight off clk_in
+	// (the testbench clock). The board build (no -DSIM) uses the real PLL below.
+	assign clk = clk_in;
+	assign pll_locked = 1'b1;
+`else
 	SB_PLL40_PAD #(
 		.FEEDBACK_PATH("SIMPLE"),
 		.DIVR(4'b0000),
-		.DIVF(7'b0101110),
+		.DIVF(7'b0101101),
 		.DIVQ(3'b101),
 		.FILTER_RANGE(3'b001)
 	) pll (
@@ -63,6 +71,7 @@ module icebreaker (
 		.BYPASS(1'b0),
 		.LOCK(pll_locked)
 	);
+`endif
 
 	reg [5:0] reset_cnt = 0;
 	wire resetn = &reset_cnt;
@@ -149,6 +158,7 @@ module icebreaker (
 		.ENABLE_FAST_MUL(1),
 		.ENABLE_COMPRESSED(0), // off: rv32im has no C extension
 		.ENABLE_ICACHE(1),     // 1: instruction cache on; 0: direct flash fetch (baseline)
+		.FLASH_INIT_MODE(0),   // rollout stage 1: dual-I/O (0xBB) reset default -- the real ~2x fast-read win
 		.MEM_WORDS(MEM_WORDS)
 	) soc (
 		.clk          (clk         ),

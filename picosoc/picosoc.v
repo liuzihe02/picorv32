@@ -77,6 +77,7 @@ module picosoc (
 	parameter [0:0] ENABLE_COUNTERS = 1;
 	parameter [0:0] ENABLE_IRQ_QREGS = 0;
 	parameter [0:0] ENABLE_ICACHE = 1;   //default icache on
+	parameter [1:0] FLASH_INIT_MODE = 0; // spimemio reset read-mode: 0=single 1=dual 2=quad 3=qddr
 
 	parameter integer MEM_WORDS = 256;
 	parameter [31:0] STACKADDR = (4*MEM_WORDS);       // end of memory
@@ -187,7 +188,9 @@ module picosoc (
 		assign cache_rdata  = spimem_rdata;
 	end endgenerate
 
-	spimemio spimemio (
+	spimemio #(
+		.INIT_MODE(FLASH_INIT_MODE)
+	) spimemio (
 		.clk    (clk),
 		.resetn (resetn),
 		.valid  (spimem_valid),

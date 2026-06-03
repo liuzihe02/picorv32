@@ -157,7 +157,7 @@ module spiflash (
 				if (bytecount == 5) begin
 					xip_cmd = (buffer == 8'h a5) ? spi_cmd : 8'h 00;
 					mode = mode_dspi_wr;
-					dummycount = latency;
+					dummycount = 0;  // W25Q128JV 0xBB Dual I/O: M7-M0 mode byte is the turnaround, no dummy clocks (generic `latency`=8 was wrong)
 				end
 
 				if (bytecount >= 5) begin

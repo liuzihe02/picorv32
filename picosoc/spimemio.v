@@ -111,8 +111,9 @@ module spimemio #(
 			// config_dummy must match the command or the data phase mis-aligns; values
 			// match the firmware set_flash_mode_* setters. {config_ddr,config_qspi} is
 			// what the state-4 command mux decodes.
-			// NOTE: modes 2/3 (quad/qddr) also require the flash QE bit to be set, which
-			// is NOT done yet -- only modes 0 (single) and 1 (dual) are functional currently
+			// NOTE: quad/qddr need the flash QE bit set first; the reset init FSM issues that
+			// (0x50 WREN-vol + 0x31 WRSR2<=0x02, states 13-17) before the first read. All four
+			// modes are functional and verified on board (mode 3 qddr incl. DDR I/O timing).
 			config_cont <= 0;   // CRM is software-only (cfgreg bit 20); never a reset default
 			case (INIT_MODE)
 				2'd0: begin config_ddr <= 0; config_qspi <= 0; config_dummy <= 8; end // single 0x03 (dummy unused)
@@ -213,7 +214,7 @@ module spimemio #(
 		.flash_io3_di (flash_io3_di)
 	);
 
-	reg [3:0] state;
+	reg [4:0] state;   // [4:0] (not [3:0]): QE-init adds states 13-17
 
 	always @(posedge clk) begin
 		xfer_resetn <= 1;
@@ -270,6 +271,53 @@ module spimemio #(
 				end
 				3: begin
 					if (dout_valid) begin
+						xfer_resetn <= 0;
+						// quad/qddr (config_qspi=1) set the flash QE bit first; single/dual skip to the read cmd
+						state <= config_qspi ? 13 : 4;
+					end
+				end
+
+				// ---- QE-init (quad/qddr only) ------------------------------------------------
+				// Set the flash QE bit (SR2 bit 1) so IO2/IO3 carry data for 0xEB/0xED. Sent in
+				// single-bit SPI (din_qspi/din_ddr still 0). Volatile write -- 0x50 (WREN-volatile)
+				// then 0x31 (WRSR2) <= 0x02 -- so it is instant, wear-free, and re-applied every
+				// reset, making quad work for ANY firmware (the reset-vector fetch precedes boot()).
+				// Each command is CS-framed: pulsing xfer_resetn low raises flash_csb.
+				13: begin                       // WREN-volatile (0x50)
+					din_valid <= 1;
+					din_data <= 8'h 50;
+					din_tag <= 0;
+					if (din_ready) begin
+						din_valid <= 0;
+						state <= 14;
+					end
+				end
+				14: begin                       // raise CS to commit the WREN
+					if (dout_valid) begin
+						xfer_resetn <= 0;
+						state <= 15;
+					end
+				end
+				15: begin                       // WRSR2 command (0x31)
+					din_valid <= 1;
+					din_data <= 8'h 31;
+					din_tag <= 0;
+					if (din_ready) begin
+						din_valid <= 0;
+						state <= 16;
+					end
+				end
+				16: begin                       // WRSR2 data: QE=1 -> 0x02 (tag 5 = the byte state 17 waits on)
+					din_valid <= 1;
+					din_data <= 8'h 02;
+					din_tag <= 5;
+					if (din_ready) begin
+						din_valid <= 0;
+						state <= 17;
+					end
+				end
+				17: begin                       // raise CS once 0x02 (tag 5) has fully shifted out
+					if (dout_valid && dout_tag == 5) begin
 						xfer_resetn <= 0;
 						state <= 4;
 					end

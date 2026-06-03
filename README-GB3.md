@@ -235,7 +235,7 @@ done
 **1. Fetch latency first**
 
 - instruction cache ✅ — serves hot-loop repeats in ~2 cyc instead of ~128
-- SPI flash fast-read defaults ❌ — shrinks the cold-miss penalty; complementary to the cache
+- SPI flash fast-read defaults ✅ — dual/quad/qddr reset defaults all shipped (qddr committed); shrinks the cold-miss penalty, complementary to the cache (CRM still parked)
 
 Until fetch is cheap, the other two levers are *invisible*: core-CPI and clock wins are overwhelmed by horrible flash stall.
 
@@ -257,7 +257,7 @@ The PLL is gated on the critical path. But it's the highest-leverage lever once 
 | PLL (12 → ~18.4 MHz) | $T_c$ | low | high | low | ✅ |
 | `COMPRESSED_ISA=0` | $T_c$ | low | high | low | ✅ |
 | `TWO_CYCLE_ALU/COMPARE` + retiming | $T_c$ | low | cond. combine w/higher clock.| low | ❌ |
-| Flash fast-read (Dual/Quad/DDR + CRM) | fetch | low | high | low–med | ❌ |
+| Flash fast-read (Dual/Quad/DDR; CRM parked) | fetch | low | high | low–med | ✅ |
 | Instruction cache (EBR) | fetch | med | high | med | ✅ |
 | Loop buffer | fetch | low–med | med | low | ❌ |
 | `BARREL_SHIFTER=1` | core CPI | low | low | low | ✅ |
@@ -265,6 +265,8 @@ The PLL is gated on the critical path. But it's the highest-leverage lever once 
 | Full 5-stage pipeline | core CPI | high | high | high | ❌ |
 
 ### Flash fast-read
+
+> **Status: shipped.** Dual / Quad / Quad-DDR reset defaults all implemented and verified on board; mode 3 (qddr) is the committed `FLASH_INIT_MODE` in `icebreaker.v`. The flash QE bit is set in hardware by `spimemio`'s reset init FSM (states 13–17), so fast fetch holds for any firmware. CRM remains parked.
 
 The cheapest fetch win: `spimemio` already supports Dual/Quad/DDR + CRM but powers up in the slowest single-bit mode and never leaves it, so a word costs ~64 SPI clocks instead of ~20 (Quad+CRM) or ~8 (sustained sequential address fetches).
 
@@ -314,22 +316,55 @@ Rather than hand-edit `spimemio.v` per experiment, parameterise its reset defaul
 
 A single `INIT_MODE` enum (not four raw bits) is deliberate: `config_dummy` **must** match the command (`0xBB`→0, `0xEB`→4, `0xED`→7) or the data phase mis-aligns and fetches garbage. The enum derives the correct dummy internally, so an illegal combo is unrepresentable. (Dummy values are lifted from the known-good firmware `set_flash_mode_*` setters.)
 
-#### Rollout (staged by risk)
+#### Rollout (staged by risk) — **all shipped**
 
-1. **Dual (`FLASH_INIT_MODE=1`) — first.**
+1. **Dual (`FLASH_INIT_MODE=1`) ✅ — first.**
    1. Firmware-independent, **no QE bit needed** (uses IO0/IO1, the always-on data pins), ~2× transfer, near-zero logic. The safe baseline win.
-2. **Quad (`FLASH_INIT_MODE=2`) — needs a QE-init FSM.**
+2. **Quad (`FLASH_INIT_MODE=2`) ✅ — QE-init FSM added.**
    1. `0xEB`/`0xED` use IO2/IO3, which on the W25Q128JV default to `/WP` and `/HOLD`; they only become data lines when the flash's **QE bit (SR2 bit 1, S9)** is set — and that bit lives *inside the flash*, not the FPGA, so the read command alone can't enable it.
-> **Why an FSM and not firmware:** software *can* set QE (that's `set_flash_qspi_flag()` in `boot()`, which is how the live menu measures quad) — but `boot()` runs *after* the reset-vector fetch, and a quad reset default fetches that first instruction in quad mode before any firmware executes. Too late. So the controller has to set QE itself: extend `spimemio`'s reset init chain (currently `0xFF`→`0xAB`) to also issue `0x50` (write-enable volatile) + `0x31` (WRSR2, QE=1), each CS-framed, before the first read. Volatile = instant, no flash-endurance wear, re-applied every reset → works for any firmware.
-3. **Quad DDR (`FLASH_INIT_MODE=3`) — last.** Same QE requirement *plus* DDR I/O timing closure (the negedge `xfer_io*_90` path).
+> **Why an FSM and not firmware:** software *can* set QE (that's `set_flash_qspi_flag()` in `boot()`, which is how the live menu measures quad) — but `boot()` runs *after* the reset-vector fetch, and a quad reset default fetches that first instruction in quad mode before any firmware executes. Too late. So the controller sets QE itself: `spimemio`'s reset init chain (`0xFF`→`0xAB`) **now also issues** `0x50` (write-enable volatile) + `0x31` (WRSR2, QE=1) in states 13–17, each CS-framed, before the first read. Volatile = instant, no flash-endurance wear, re-applied every reset → works for any firmware.
+3. **Quad DDR (`FLASH_INIT_MODE=3`) ✅ — DDR timing closed on board (committed default).** Same QE requirement (covered by the same FSM) *plus* DDR I/O timing on the negedge `xfer_io*_90` path — which held up on the board.
 
-**Verify each step:** `make icebsim` (the `spiflash.v` model handles `0xBB`/`0xEB`/`0xED`), confirm the 45 `tests/*.S` still pass, then measure `bench_cold` / fetch CPI via `run_flashmodes` / `run_scope`.
+**Verified:** `make icebsim` boots clean in every mode (`spiflash.v` model handles `0xBB`/`0xEB`/`0xED` with matched dummy), the 45 `tests/*.S` are unaffected (flash-path change only), and quad/qddr were confirmed on board via `run_flashmodes` / `run_scope`.
+
+performance with `qddr` and no `crm` (makes a super tiny difference anyway I tested it)
+```txt
+clock = 17.250 MHz
+
+benchmark     |     cycles |   instrs |    CPI | wallclock (ms) | chk | mix
+--------------+------------+----------+--------+----------------+-----+----
+-- Compute --
+alu           |   12750633 |  1850038 |   6.89 |        739.167 |  82 | 
+shift         |   11813079 |  1700031 |   6.94 |        684.816 |   0 | 
+mul           |   12700665 |  2050038 |   6.19 |        736.270 | 124 | 
+div           |   11360572 |  1240032 |   9.16 |        658.583 | 183 | 
+branch        |   21062956 |  2974936 |   7.08 |       1221.040 |  64 | 
+call          |   27600667 |  4100028 |   6.73 |       1600.038 |  32 | 
+-- Memory --
+memcpy        |    6200037 |   930068 |   6.66 |        359.422 |  64 | 
+chase         |    6128664 |   904386 |   6.77 |        355.284 | 136 | 
+-- Fetch --
+hot           |   26800532 |  4000027 |   6.70 |       1553.654 | 117 | 
+cold          |    8260938 |  1029530 |   8.02 |        478.894 | 239 | 
+-- Programs --
+bubble_sort   |    4831139 |   756032 |   6.39 |        280.066 |  77 | branch/ld-st
+matmul        |   18776005 |  2922496 |   6.42 |       1088.464 | 204 | mul/ld-st
+crc32         |   19704453 |  3075453 |   6.40 |       1142.287 |   0 | shift/xor
+prime_count   |    5227904 |   521375 |  10.02 |        303.066 | 141 | div/branch
+fir           |   27799599 |  4328124 |   6.42 |       1611.570 | 214 | mul/shift
+strsearch     |   10514874 |  1568299 |   6.70 |        609.557 | 200 | ld/branch
+interp        |   26100794 |  3909943 |   6.67 |       1513.089 |  78 | jump/branch
+game_of_life  |  150108128 | 23041099 |   6.51 |       8701.920 |  33 | branch/ld-st
+fib_rec       |   18070777 |  2755365 |   6.55 |       1047.581 | 179 | call/ld-st
+xorshift_mc   |   58534341 |  8235354 |   7.10 |       3393.295 |  65 | mul/shift
+done
+```
 
 #### Sim model (`spiflash.v`) gotchas
 
 The sim flash model has to agree with the controller on **two** things per mode, or `icebsim` lies:
 
-1. **Dummy cycles must match `config_dummy`.** After the address+mode byte, the model tristates the bus for its dummy count while the controller starts clocking for *data* on its own `config_dummy` schedule. If they differ, the controller samples `Z`→`x` and latches a misaligned/garbage word. So the model's per-command dummy must equal the controller's: `0xBB`→**0**, `0xEB`→**4**, `0xED`→**7**. The stock model hardcoded a generic `latency`=8 for *all* fast-read commands — wrong for every one of ours. **Fixed for `0xBB`** (`dummycount = 0`, since the M7–M0 mode byte *is* the turnaround on the W25Q128JV — no separate dummy clocks). **`0xEB`/`0xED` still use `latency`=8** and must drop to 4/7 before quad/qddr sim is trustworthy.
+1. **Dummy cycles must match `config_dummy`.** After the address+mode byte, the model tristates the bus for its dummy count while the controller starts clocking for *data* on its own `config_dummy` schedule. If they differ, the controller samples `Z`→`x` and latches a misaligned/garbage word. So the model's per-command dummy must equal the controller's: `0xBB`→**0**, `0xEB`→**4**, `0xED`→**7**. The stock model hardcoded a generic `latency`=8 for *all* fast-read commands — wrong for every one of ours. **Now fixed for all three:** `0xBB`→`0` (the M7–M0 mode byte *is* the turnaround on the W25Q128JV — no separate dummy clocks), `0xEB`→`4`, `0xED`→`7`, matching `config_dummy`, so `icebsim` aligns the data phase in every mode.
 2. **The model does *not* model the QE bit.** It ignores the `0x35`/`0x31`/`0x50`/`0x06` register sequence and answers `0xEB`/`0xED` regardless of QE state. So quad "works" in sim without ever setting QE — meaning **sim cannot validate the QE-init FSM** (rollout step 2); only the board can. A green `icebsim` for quad is *not* proof the QE sequence is right.
 
 **Deeper prefetch (line buffer).** `spimemio`'s streamer keeps sequential reads cheap but restarts the full command+address phase on *every* non-sequential fetch, so each taken branch/call/return pays the worst-case latency. A small fully-associative line buffer (a few recently-fetched lines) inside `spimemio` absorbs short backward branches — a partial, few-LC substitute for the CPU-side cache below.

@@ -182,7 +182,7 @@ module spiflash (
 				if (bytecount == 5) begin
 					xip_cmd = (buffer == 8'h a5) ? spi_cmd : 8'h 00;
 					mode = mode_qspi_wr;
-					dummycount = latency;
+					dummycount = 4;  // W25Q128JV 0xEB Quad I/O: 2-clock mode byte + 4 dummy clocks; must match spimemio config_dummy=4 (generic `latency`=8 was wrong)
 				end
 
 				if (bytecount >= 5) begin
@@ -207,7 +207,7 @@ module spiflash (
 				if (bytecount == 5) begin
 					xip_cmd = (buffer == 8'h a5) ? spi_cmd : 8'h 00;
 					mode = mode_qspi_ddr_wr;
-					dummycount = latency;
+					dummycount = 7;  // W25Q128JV 0xED DDR Quad I/O: 7 dummy clocks; must match spimemio config_dummy=7
 				end
 
 				if (bytecount >= 5) begin

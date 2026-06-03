@@ -158,7 +158,7 @@ module icebreaker (
 		.ENABLE_FAST_MUL(1),
 		.ENABLE_COMPRESSED(0), // off: rv32im has no C extension
 		.ENABLE_ICACHE(1),     // 1: instruction cache on; 0: direct flash fetch (baseline)
-		.FLASH_INIT_MODE(0),   // rollout stage 1: dual-I/O (0xBB) reset default -- the real ~2x fast-read win
+		.FLASH_INIT_MODE(3),   // 0=single(0x03) 1=dual(0xBB) 2=quad(0xEB) 3=qddr(0xED)
 		.MEM_WORDS(MEM_WORDS)
 	) soc (
 		.clk          (clk         ),

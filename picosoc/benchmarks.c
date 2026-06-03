@@ -30,20 +30,46 @@ uint32_t time_benchmark(bench_fn fn, uint32_t *instrs, uint8_t *chk)
 	return c1 - c0;
 }
 
-// Print CPI (cycles/instr) to 2 decimals via integer math, e.g. "4.27".
-// No float/libgcc (no 64-bit divide), so divide first then scale the remainder:
-// the whole part is cyc/ins, and frac = (cyc%ins)*100/ins. Since cyc%ins < ins,
-// (cyc%ins)*100 can't overflow uint32 for any realistic ins -- unlike cyc*100,
-// which wrapped once cyc exceeded ~43M (the fetch-bound baseline runs are >50M).
-void print_cpi(uint32_t cyc, uint32_t ins)
+// --- number formatting (no float / libgcc, no 64-bit divide) ------------
+// Each fmt_* writes a NUL-terminated string into the caller's buffer `b` (no static
+// state -> reentrant). Caller sizes it: >=11 for fmt_u32, >=16 for fmt_cpi/fmt_ms.
+
+// uint32 -> decimal in `b`; returns digit count. Digits come out LSB-first, so
+// stage in `t` and reverse.
+static int fmt_u32(uint32_t v, char *b)
 {
-	if (!ins) { print("--"); return; }
-	print_dec(cyc / ins);
-	putchar('.');
-	uint32_t frac = ((cyc % ins) * 100u) / ins;
-	if (frac < 10) putchar('0');
-	print_dec(frac);
+	char t[10]; int n = 0;
+	if (!v) { b[0] = '0'; b[1] = 0; return 1; }
+	while (v) { t[n++] = '0' + v % 10; v /= 10; }
+	for (int i = 0; i < n; i++) b[i] = t[n - 1 - i];
+	b[n] = 0;
+	return n;
 }
+
+// CPI as "X.YY" into `b` ("--" if ins==0). Integer-only: frac = (cyc%ins)*100/ins,
+// not cyc*100/ins, which overflows uint32 once cyc > ~43M.
+static void fmt_cpi(uint32_t cyc, uint32_t ins, char *b)
+{
+	if (!ins) { b[0] = b[1] = '-'; b[2] = 0; return; }
+	int k = fmt_u32(cyc / ins, b);
+	uint32_t f = ((cyc % ins) * 100u) / ins;
+	b[k++] = '.'; b[k++] = '0' + f / 10; b[k++] = '0' + f % 10; b[k] = 0;
+}
+
+// Wall-clock "X.YYY" ms into `b`. f_clk = F_CLK_HZ (benchmarks.h, also sets the UART
+// divisor -> tracks the PLL). Work in kHz to keep the math in uint32.
+static void fmt_ms(uint32_t cyc, char *b)
+{
+	uint32_t khz = F_CLK_HZ / 1000u;   // e.g. 17625
+	if (!khz) { b[0] = b[1] = '-'; b[2] = 0; return; }
+	int k = fmt_u32(cyc / khz, b);
+	uint32_t f = ((cyc % khz) * 1000u) / khz;
+	b[k++] = '.'; b[k++] = '0' + f / 100; b[k++] = '0' + (f / 10) % 10; b[k++] = '0' + f % 10; b[k] = 0;
+}
+
+// Format-and-print wrappers (used by run_scope); the dashboard calls fmt_* directly to pad.
+void print_cpi(uint32_t cyc, uint32_t ins) { char b[16]; fmt_cpi(cyc, ins, b); print(b); }
+void print_ms(uint32_t cyc)                { char b[16]; fmt_ms(cyc, b);       print(b); }
 
 // --- deterministic PRNG (fixed seed) ------------------------------------
 
@@ -309,16 +335,47 @@ const int bench_count = (int)(sizeof(bench_table) / sizeof(bench_table[0]));
 
 static const char *group_name[4] = { "Compute", "Memory", "Fetch", "Programs" };
 
-static void pad(const char *s, int w)
+// left-align s in width w (trailing spaces)
+static void lcol(const char *s, int w)
 {
 	int n = 0;
 	while (s[n]) { putchar(s[n]); n++; }
 	while (n < w) { putchar(' '); n++; }
 }
 
+// right-align s in width w (leading spaces)
+static void rcol(const char *s, int w)
+{
+	int n = 0; while (s[n]) n++;
+	while (n < w) { putchar(' '); n++; }
+	print(s);
+}
+
+static void dashes(int n) { while (n-- > 0) putchar('-'); }
+
+// Aligned columns separated by " | "; a matching "-+-" rule sits under the header.
 void run_benchmarks(void)
 {
-	print("\nbenchmark (cycles  instrs  CPI  checksum)\n");
+	char buf[16];
+
+	// clock line: print F_CLK_HZ in kHz via fmt_u32, then insert a '.' 3 digits from
+	// the right -> "XX.YYY MHz" (kHz resolution). fmt_u32's length tells us where.
+	int n = fmt_u32(F_CLK_HZ / 1000u, buf);     // e.g. 16875
+	print("\nclock = ");
+	for (int i = 0; i < n - 3; i++) putchar(buf[i]);
+	putchar('.');
+	for (int i = n - 3; i < n; i++) putchar(buf[i]);
+	print(" MHz\n\n");
+
+	lcol("benchmark", 13);      print(" | ");
+	rcol("cycles", 10);         print(" | ");
+	rcol("instrs", 8);          print(" | ");
+	rcol("CPI", 6);             print(" | ");
+	rcol("wallclock (ms)", 14); print(" | ");
+	rcol("chk", 3);             print(" | mix\n");
+	dashes(13); print("-+-"); dashes(10); print("-+-"); dashes(8);  print("-+-");
+	dashes(6);  print("-+-"); dashes(14); print("-+-"); dashes(3);  print("-+-"); dashes(3); print("\n");
+
 	int g = -1;
 	for (int i = 0; i < bench_count; i++) {
 		const bench_t *b = &bench_table[i];
@@ -328,12 +385,13 @@ void run_benchmarks(void)
 		uint8_t  chk;
 		uint32_t cyc = time_benchmark(b->fn, &ins, &chk);
 
-		pad(b->name, 14);
-		print_dec(cyc);       print("   ");
-		print_dec(ins);       print("   ");
-		print_cpi(cyc, ins);  print("   ");
-		print_dec(chk);
-		if (b->hint[0]) { print("   "); print(b->hint); }
+		lcol(b->name, 13);                        print(" | ");
+		fmt_u32(cyc, buf);      rcol(buf, 10);    print(" | ");
+		fmt_u32(ins, buf);      rcol(buf, 8);     print(" | ");
+		fmt_cpi(cyc, ins, buf); rcol(buf, 6);     print(" | ");
+		fmt_ms(cyc, buf);       rcol(buf, 14);    print(" | ");
+		fmt_u32(chk, buf);      rcol(buf, 3);     print(" | ");
+		print(b->hint);
 		print("\n");
 	}
 	print("done\n");

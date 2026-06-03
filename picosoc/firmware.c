@@ -385,6 +385,8 @@ void run_scope(void)
 
 		print(" CPI=");
 		print_cpi(cyc, ins);
+		print(" ms=");
+		print_ms(cyc);
 		print("\n");
 	}
 }
@@ -430,7 +432,7 @@ void boot()
 {
 	// Low-current boot progress: ONE LED per step (led1 -> led2 -> led3), never the all-on word.
 	reg_leds = 0x02;            // led1
-	reg_uart_clkdiv = 153;      // 17.625 MHz / 115200 baud
+	reg_uart_clkdiv = (F_CLK_HZ + BAUD/2) / BAUD;   // rounded f_clk / baud (F_CLK_HZ, BAUD in benchmarks.h)
 	reg_7seg = 0x00;
 
 	reg_leds = 0x04;            // led2

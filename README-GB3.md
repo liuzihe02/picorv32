@@ -110,7 +110,12 @@ Every benchmark — micro or program — is a `uint8_t bench_NAME(void)` (frozen
 - **Return a byte checksum folded from all the work**, so dead-code elimination can't delete the kernel.
 - **Fixed seeds / static SPRAM inputs** (`xorshift32` for any pseudo-random data) → deterministic `N`, cycle count, and a known-good checksum that doubles as a correctness regression test after each hardware edit.
 - **An inner loop count** (a literal in each kernel, e.g. `50000`) scales the run into a clean Picoscope window *without changing the instruction mix*.
-- **Measurement**: `time_benchmark()` logs `cycles` / `instrs` / `CPI` over UART (sim and board) — driven per-suite by `run_benchmarks()` and on the scored path by `run_scope()`, which toggles LED1; read wall-clock from the LED1 period on the scope and cross-check against $T_{\text{exec}} = N \times \text{CPI} \times T_c$. `N` is fixed by the frozen source, so every delta is pure $\text{CPI} \times T_c$.
+- **Measurement**: `time_benchmark()` logs `cycles` / `instrs` / `CPI` over UART (sim and board) — driven per-suite by `run_benchmarks()` (menu `T`, all 16) and on the scored path by `run_scope()` (menu `B`), which loops `run_workload()` and toggles LED1. Two ways to get **wall-clock time**:
+
+  - **Method A — from the UART cycle count (works for every benchmark).** `rdcycle` counts *clock cycles, not time*, so wall-clock is $t = \text{cycles}/f_{clk}$ (e.g. matmul $18{,}702{,}160 / 17.625\text{ MHz} \approx 1.06$ s/pass). **You don't divide by hand** — `run_benchmarks`/`run_scope` print an `ms` column via `print_ms()`, which uses the **`F_CLK_HZ` constant in `benchmarks.h`** (the single source of truth: `boot()` derives the UART divisor from it too, so changing the PLL means editing *one* `#define`). This is the cleanest figure for the kernel itself: `time_benchmark` brackets *only* `fn()`, so no UART/print overhead leaks in.
+  - **Method B — Picoscope on LED1 (the scored, ground-truth method).** `run_scope` toggles LED1 once per pass → a square wave; wall-clock per pass = **period / 2** (it toggles every pass, so a full period spans two). The scope measures real time, so it auto-accounts for `f_clk`. Only scopes the *one* benchmark in `run_workload()`; for the full suite use Method A per line.
+
+  The two should agree — if they don't, your `f_clk` is wrong, and you can back out the real clock as $f_{clk} = \text{cycles} / (\text{LED1 period}/2)$ (a reliable way to confirm the PLL frequency). Cross-check either against $T_{\text{exec}} = N \times \text{CPI} \times T_c$; `N` is fixed by the frozen source, so every delta is pure $\text{CPI} \times T_c$.
 - **Size every benchmark to a similar runtime** so the dashboard reads cleanly. Each kernel's code footprint (`size` of its `bench_*`) predicts cache behaviour.
 
 ### Layer 1 — Core-operation microbenchmarks
@@ -216,27 +221,39 @@ done
 
 ### Optimization Order
 
-Because the baseline is fetch-bound, Amdahl's Law dictates the dominant term first: **fetch latency before core CPI**.
-> As long as each instruction stalls tens of cycles on flash, cutting core CPI from 4 to 1 gives basically no speedup (hence pipelining is useless for now). But this is fixed with instruction cache =)
+`T_exec = N × CPI × T_c`, with `N` frozen (we cant modify compiler) and `CPI = CPI_fetch + CPI_core`. `CPI_core` is the CPU system CPI, while `CPI_fetch` is CPI due to making SPI fetches. Then there are **three** levers: fetch-stall CPI, core CPI, and clock period `T_c`. Amdahl's Law sets the order — the baseline is ~70 CPI and almost all of it is fetch-stall:
 
-So the order is approximately:
+> As long as each instruction stalls tens of system cycles on flash, cutting core CPI from 4 to 1 gives basically no speedup (hence pipelining is useless *for now*). Fixed by the instruction cache =)
 
-- fast-read defaults
-- instruction cache
-- core-CPI tweaks
-- pipelining
+**1. Fetch latency first**
 
-PLL optimizations can be applied for free.
+- instruction cache ✅ — serves hot-loop repeats in ~2 cyc instead of ~128
+- SPI flash fast-read defaults ❌ — shrinks the cold-miss penalty; complementary to the cache
+
+Until fetch is cheap, the other two levers are *invisible*: core-CPI and clock wins are overwhelmed by horrible flash stall.
+
+**2. Then core CPI and clock** — only worth attacking once fetch is cheap; two *independent* levers:
+
+- **Core CPI:**
+  - `BARREL_SHIFTER` ✅ 
+  - fast-path load/store
+  - radix-4 divider
+  - full 5-stage pipeline (`CPI_core` → ~1)
+- **Clock `T_c`:**
+  - PLL ✅ at 17.625 MHz, already maxed against the ~18.5 MHz logic critical path.
+  - Going higher needs the path *shortened* first (`TWO_CYCLE_ALU`/retiming)
+
+The PLL is gated on the critical path. But it's the highest-leverage lever once unlocked (~2.8× at 50 MHz, speeds even fetch-bound code), so critical-path work (`TWO_CYCLE_ALU`, pipelining) pulls double duty: lower core CPI *and* a higher clock.
 
 | Optimisation | Lever | Effort | Reward | Risk | Done |
 | --- | --- | --- | --- | --- | :---: |
-| PLL (12 → 24 MHz+) | $T_c$ | low | high | low | ❌ |
+| PLL (12 → 17.6 MHz) | $T_c$ | low | high | low | ✅ |
 | `COMPRESSED_ISA=0` | $T_c$ | low | high | low | ✅ |
-| `TWO_CYCLE_ALU/COMPARE` + retiming | $T_c$ | low | cond. | low | ❌ |
+| `TWO_CYCLE_ALU/COMPARE` + retiming | $T_c$ | low | cond. combine w/higher clock.| low | ❌ |
 | Flash fast-read (Dual/Quad/DDR + CRM) | fetch | low | high | low–med | ❌ |
 | Instruction cache (EBR) | fetch | med | high | med | ✅ |
 | Loop buffer | fetch | low–med | med | low | ❌ |
-| `BARREL_SHIFTER=1` | core CPI | low | med | low | ❌ |
+| `BARREL_SHIFTER=1` | core CPI | low | low | low | ✅ |
 | Fast-path load/store; SRT divider | core CPI | med | med | low–med | ❌ |
 | Full 5-stage pipeline | core CPI | high | high | high | ❌ |
 
@@ -633,11 +650,96 @@ The full core-CPI win (CPI→~1), but the riskiest. Approach: incrementally pipe
 
 Needs separate instruction/data paths (cache + SPRAM, distinguished by `mem_instr`), pipeline registers, **forwarding** (Mem/WB → Execute), and a **hazard unit** (load-use stall, branch flush). Four picorv32-specific challenges: deferred writeback must become a real WB stage; iterative shifts need the barrel shifter; PCPI mul/div must insert bubbles; the two-cycle decode must fit one Decode stage. Rough cost +1500–2000 LCs (with the cache, ~3500–4500 / 5280 — tight but feasible). **Branch prediction (BTB + RAS) is deferred** — it only pays once the pipeline exposes the control bubble that the cache otherwise hides.
 
-### Clock frequency and critical path
+### Clock frequency and Critical Path
 
-- **Target:** 24 MHz via PLL (36–48 stretch). A faster $f_{clk}$ also speeds the flash interface in wall-clock terms, so it helps even fetch-bound code.
-- **Hard ceilings:** SPRAM 70 MHz and DSP 50 MHz cap $f_{max}$ at ~48 MHz regardless of logic path.
-- **`TWO_CYCLE_ALU/COMPARE`:** shorten the critical path but add a cycle per ALU op on the multicycle core — best viewed as a pipeline stage-balancing tool, not a free win.
+#### PLL
+
+The board only supplies a raw **12 MHz** crystal on the clock pad. The iCE40's hard **PLL** (`SB_PLL40_PAD`) multiplies that reference up to a faster system clock. Currently set to **17.625 MHz** — the current design's $f_{max}$. Refer to the `SB_PLL40_PAD` code block in `icebreaker.v`:
+
+```verilog
+module icebreaker (
+	input clk_in, // physical pin input now drives the PLL, instead of system clock directly
+  ...
+);
+...
+wire clk;            // system clock, driven by PLL
+wire pll_locked;
+...
+SB_PLL40_PAD #(
+    .FEEDBACK_PATH("SIMPLE"),
+    .DIVR(4'b0000),       // = 0
+    .DIVF(7'b0101110),    // = 46
+    .DIVQ(3'b101),        // = 5
+    .FILTER_RANGE(3'b001)
+) pll (
+    .PACKAGEPIN(clk_in),  // 12 MHz crystal pad (pin 35) as input
+    .PLLOUTCORE(clk),     // go through PLL for synthesized system clock out
+    .RESETB(1'b1), .BYPASS(1'b0),
+    .LOCK(pll_locked)
+);
+...
+```
+
+**The frequency** is set by three dividers (run `icepll -i 12 -o <ideal_freq>` to get valid values for a new target):
+
+$$
+f_{out} = f_{ref}\,\frac{DIVF+1}{(DIVR+1)\,2^{DIVQ}} = 12\,\frac{47}{32} = 17.625\text{ MHz}
+$$
+
+Physical constraints bound our divider values: the **VCO** ($f_{ref}\frac{DIVF+1}{DIVR+1}$) must stay in **533–1066 MHz**, the phase-detector input ≥ 10 MHz, and the **PLL output floor is 16 MHz**. Lock takes ≤ 50 µs (the reason for the reset-until-`pll_locked` gate).
+
+> Note SCK (= clk/2) rises in lockstep, so a flash fetch still costs the same *number of cycles* but less wall-clock time — the PLL helps even fetch-bound code.
+
+#### Setting a custom clock rate
+
+You request `icepll` for an `<ideal_freq>`. It then computes accounting for physcial constraints, and returns the **nearest achievable** `<target_freq>` which is is what we'll use.
+
+1. **Compute divisors** — `icepll -i 12 -o <ideal_freq>` prints `DIVR`/`DIVF`/`DIVQ`/`FILTER_RANGE` **and** the actual `<target_freq>` it landed on (ask for 20 → get 19.875).
+2. **`icebreaker.v`** — paste those four divider values into the `SB_PLL40_PAD #( ... )` params.
+3. **`benchmarks.h`** — set `F_CLK_HZ` to `<target_freq>` (in Hz). `firmware.c` derives the UART divisor (`= round(F_CLK_HZ/BAUD)`) and `benchmarks.c` derives wall-clock time from it
+4. **`PicoSoC Makefile`** — `nextpnr-ice40 --freq <target_freq>` (the P&R target).
+5. **`PicoSoC Makefile`** — `icetime -d up5k -c <target_freq>` (the timing-check constraint).
+
+> Then rebuild and read `icebreaker.rpt`: if its `Total path delay` line reports a frequency **below** `<target_freq>`, timing failed — lower the target (or shorten the critical path) and retry.
+> The final timing netlist will report something like `Creating timing netlist.. Timing estimate: 53.63 ns (18.64 MHz)... Checking 53.33 ns (18.75 MHz) clock constraint: FAILED.` so you'll need to lower the target frequency
+
+#### Clock Ceilings
+
+The achievable clock is the **minimum** of several independent limits:
+
+| Limit | Freq | Binding when… |
+| --- | ---: | --- |
+| **Logic critical path** | **~18.5 MHz (now)** | **currently** — see Critical Path below |
+| DSP `MULT16×16` (pipeline bypassed) | 50 MHz | once logic < 20 ns; `pcpi_fast_mul` maps to the DSP, clocked at `clk` |
+| SPRAM read/write | 70 MHz | once the DSP is pipelined or fast-mul dropped |
+| EBR / regfile | 150 MHz | never binding here |
+| Global clock net | 185 MHz | never binding here |
+
+**How to get critical path frequency:**
+- check `icebreaker.rpt` (icetime): `Total path delay: 54.18 ns (18.46 MHz)`
+- nextpnr (print to terminal after synth) also prints `Max frequency for clock ...: 19.94 MHz (PASS at 18.38 MHz)` to stdout.
+
+**Currently this is at 18.5Hz**, bottlenecked by critical path.
+- **Shorten the critical path** (`TWO_CYCLE_ALU`/`TWO_CYCLE_COMPARE` + retiming), decrease our critical path until its no longer the bottleneck to increase clock speed further. Then next bottleneck is DSP 50MHz.
+
+The payoff is large because the PLL speeds *everything* linearly in wall-clock (including flash, since SCK = clk/2). But it's **gated on critical-path work**, which is why the cache (works today) comes first and `T_c` tweaks are enablers.
+
+##### Critical Path
+
+The actual critical path (`icebreaker.rpt`, post-route at 16.875 MHz):
+
+```text
+mem_addr (DFF) → iomem_addr → iomem_ready (mem_ready decode mux) → flash_io3_di
+  → mem_xfer → mem_state → latched_store → cpu_state → instr_sw/lw/lbu (decode)
+  → reg_op1.CEN (setup)
+```
+
+That's the memory-bus **`mem_ready` / address-decode + instruction-decode** combinational cloud feeding `reg_op1`'s clock-enable — **15 logic levels, ~35 ns routing vs ~15 ns logic** (routing-dominated). The ALU (`alu_add_sub` / `alu_out`) appears **nowhere** on it.
+
+**Pushing past ~18.6 MHz:**
+
+- **`TWO_CYCLE_ALU` is the wrong lever here.** It relaxes the ALU path — which isn't critical — so it wouldn't raise this `f_max` at all, just +1 cycle/ALU op for nothing.
+- **The real lever is breaking the `mem_ready` / decode chain:** the OR-mux'd `mem_ready` priority chain in `picosoc.v` (cache + GPIO `iomem_ready` + SPRAM + UART), plus picorv32's `instr_*` decode. Registering `mem_ready` (one extra wait state) or simplifying that responder/decode mux is what would move the needle — but that's a real-CPI tradeoff, not a free retiming.
 
 ### Power and Area (alternative targets)
 

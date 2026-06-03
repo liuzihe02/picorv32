@@ -16,6 +16,12 @@
 
 #include <stdint.h>
 
+// ---- System configuration ----
+// TODO: Update F_CLK_HZ whenever you change the PLL (see icebreaker.v SB_PLL40_PAD)
+// these global variables will be used everywhere
+#define F_CLK_HZ 18375000u   // PLL system clock, Hz
+#define BAUD     115200u     // UART console baud
+
 typedef uint8_t (*bench_fn)(void);
 
 // group: 0 = Compute, 1 = Memory, 2 = Fetch, 3 = Programs
@@ -37,6 +43,9 @@ void run_benchmarks(void);
 
 // print CPI (cycles/instrs) to 2 decimals via integer math, e.g. "4.27"
 void print_cpi(uint32_t cyc, uint32_t ins);
+
+// print wall-clock ms (3 decimals) for a cycle count.
+void print_ms(uint32_t cyc);
 
 // the benchmarks (Compute / Memory / Fetch / Programs)
 uint8_t bench_alu(void);

@@ -61,8 +61,20 @@ extern uint32_t sram;
 extern uint32_t flashio_worker_begin;
 extern uint32_t flashio_worker_end;
 
+// Run a raw SPI command against the flash via spimemio's manual bit-bang mode
+// (cfgreg config_en=0) -- for chip-config ops that MEMIO reads can't do: read/write
+// status registers (the QE bit), read flash ID. Half-duplex and in-place: `data` is
+// clocked out and the reply overwrites it byte-for-byte; `len` = byte count; `wrencmd`
+// is an optional write-enable opcode (e.g. 0x06 / 0x50) sent CS-framed first, or 0 for none.
+//
+// Why it copies code into a local array first: the real bit-bang routine is `flashio_worker`
+// in start.s (bracketed by the flashio_worker_begin/end linker symbols). It seizes the flash
+// pins (manual mode), so while it runs the CPU CANNOT fetch instructions from flash -- it
+// therefore can't execute in place from flash. So we copy it onto the stack (which lives in
+// 1-cycle SPRAM, not flash) and call it there.
 void flashio(uint8_t *data, int len, uint8_t wrencmd)
 {
+	// VLA sized to the worker's word count; copy the worker (flash) -> func (SPRAM)
 	uint32_t func[&flashio_worker_end - &flashio_worker_begin];
 
 	uint32_t *src_ptr = &flashio_worker_begin;
@@ -71,28 +83,42 @@ void flashio(uint8_t *data, int len, uint8_t wrencmd)
 	while (src_ptr != &flashio_worker_end)
 		*(dst_ptr++) = *(src_ptr++);
 
+	// call the SRAM-resident copy: void worker(uint8_t *data, uint32_t len, uint32_t wrencmd)
 	((void(*)(uint8_t*, uint32_t, uint32_t))func)(data, len, wrencmd);
 }
 
 
-// Flash read-mode setters (write reg_spictrl); used by run_flashmodes() for
-// measurement, not on the scored path.
+// ---- Flash fast-read settings ----
+// Quad SPI reads need BOTH settings, in order:
+//   (1) the FLASH's QE bit set      -> set_flash_qspi_flag() (poke a bit inside the chip)
+//   (2) the CONTROLLER in quad mode -> set_flash_mode_*()    (write spimemio's cfgreg)
+// QE repurposes the flash's /WP,/HOLD pins as the upper data lines IO2/IO3; without it a quad read returns garbage.
+// So (1) must happen before (2).
+// Dual (0xBB) uses only IO0/IO1, so it needs neither QE nor (1).
+
+// (1) Set the flash QE bit (SR2 bit 1) by bit-banging SPI straight to the chip.
+// Volatile (0x50), so it's instant, wear-free, and lost on power-off -> boot() re-runs it each reset.
+// This is the SOFTWARE QE-set, and why quad works after boot. A firmware-independent
+// quad *reset default* can't use it -- the reset-vector fetch runs before any firmware --
+// so that path sets QE in spimemio's reset FSM instead (README "Rollout step 2").
 void set_flash_qspi_flag()
 {
 	uint8_t buffer[8];
 
-	// Read Configuration Registers (RDCR1 35h)
+	// read Status Register 2 (RDSR2 35h) -> current QE state
 	buffer[0] = 0x35;
 	buffer[1] = 0x00; // rdata
 	flashio(buffer, 2, 0);
 	uint8_t sr2 = buffer[1];
 
-	// Write Enable Volatile (50h) + Write Status Register 2 (31h)
+	// write-enable-volatile (50h, the wrencmd) + write SR2 (31h) with QE (bit 1) set
 	buffer[0] = 0x31;
-	buffer[1] = sr2 | 2; // Enable QSPI
+	buffer[1] = sr2 | 2;
 	flashio(buffer, 2, 0x50);
 }
 
+// (2) Switch only the CONTROLLER's read command via spimemio's cfgreg (reg_spictrl); these
+// don't touch the flash's QE bit. Used by run_flashmodes() and the live menu [3]-[6].
 void set_flash_mode_spi()
 {
 	reg_spictrl = (reg_spictrl & ~0x007f0000) | 0x00000000;
@@ -475,6 +501,11 @@ void main()
 		print("\n");
 		print("   [1] Read SPI Flash ID\n");
 		print("   [2] Read SPI Config Regs\n");
+		print("   [3] Switch to single SPI mode\n");
+		print("   [4] Switch to Dual I/O mode\n");
+		print("   [5] Switch to Quad I/O mode\n");
+		print("   [6] Switch to Quad DDR mode\n");
+		print("   [7] Toggle continuous read mode\n");
 		print("   [M] Run Memtest\n");
 		print("   [S] Print SPI state\n");
 		print("   [B] Run scope (workload)\n");
@@ -498,6 +529,29 @@ void main()
 				break;
 			case '2':
 				cmd_read_flash_regs();
+				break;
+			// Live flash-mode switch: set the mode, then run [T]/[B] under it.
+			// Writing reg_spictrl soft-resets spimemio, so the new mode takes effect on the next fetch.
+			// Quad/qddr rely on the QE bit set in boot().
+			case '3':
+				set_flash_mode_spi();
+				cmd_print_spi_state();
+				break;
+			case '4':
+				set_flash_mode_dual();
+				cmd_print_spi_state();
+				break;
+			case '5':
+				set_flash_mode_quad();
+				cmd_print_spi_state();
+				break;
+			case '6':
+				set_flash_mode_qddr();
+				cmd_print_spi_state();
+				break;
+			case '7':
+				reg_spictrl = reg_spictrl ^ 0x00100000;   // toggle CRM (bit 20)
+				cmd_print_spi_state();
 				break;
 			case 'M':
 				cmd_memtest();

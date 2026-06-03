@@ -13,7 +13,6 @@
 // I/O helpers defined in firmware.c
 extern void putchar(char c);
 extern void print(const char *p);
-extern void print_dec(uint32_t v);
 
 // --- timing primitive ---------------------------------------------------
 
@@ -311,6 +310,129 @@ uint8_t bench_strsearch(void)   // naive substring search
 	return (uint8_t)acc;
 }
 
+// Recursive Fibonacci: exercises the call/return path + stack ld/st (the 5-cycle
+// memory states), picorv32's most expensive common ops. Non-tail recursion at -O0
+// builds a real frame per call. Loop bound tuned for runtime.
+static uint32_t __attribute__((noinline)) fib(uint32_t n)
+{
+	if (n < 2) return n;
+	return fib(n - 1) + fib(n - 2);
+}
+
+uint8_t bench_fib_rec(void)
+{
+	uint32_t acc = 0;
+	for (uint32_t n = 19; n <= 22; n++) acc += fib(n);   // 4 distinct recursions
+	return (uint8_t)acc;
+}
+
+// Monte-Carlo pi: quarter-circle dart throws via xorshift, fixed-point. Mix is
+// shift/xor (PRNG) + mul (x*x, y*y) + compare/branch. 15-bit coords keep x*x+y*y
+// inside uint32 (2*32767^2 < 2^32, no overflow).
+uint8_t bench_xorshift_mc(void)
+{
+	seed();
+	const uint32_t R2 = 32767u * 32767u;
+	uint32_t hits = 0;
+	for (uint32_t i = 0; i < 100000u; i++) {
+		uint32_t x = rng() >> 17;            // [0, 32767]
+		uint32_t y = rng() >> 17;
+		if (x * x + y * y <= R2) hits++;      // inside the quarter circle
+	}
+	uint32_t pi_q8 = (hits * 4u * 256u) / 100000u;   // pi ~ 4*hits/N as Q8 fixed-point
+	return (uint8_t)(hits ^ pi_q8);
+}
+
+// Conway's Game of Life: 2-D stencil over a bounded grid, K generations. Branch-heavy
+// (neighbour bounds + birth/survive rule) with streaming loads/stores over two
+// ping-pong SPRAM buffers. Footprint is *data*, so it stays cache-hot -- a memory/
+// branch program, complementary to bench_interp's fetch stress.
+#define GOL_W 40
+#define GOL_H 40
+static uint8_t gol_a[GOL_H][GOL_W], gol_b[GOL_H][GOL_W];
+
+uint8_t bench_game_of_life(void)
+{
+	seed();
+	for (int y = 0; y < GOL_H; y++)
+		for (int x = 0; x < GOL_W; x++)
+			gol_a[y][x] = rng() & 1;
+
+	uint32_t acc = 0;
+	for (uint32_t gen = 0; gen < 30u; gen++) {
+		for (int y = 0; y < GOL_H; y++)
+			for (int x = 0; x < GOL_W; x++) {
+				int n = 0;
+				for (int dy = -1; dy <= 1; dy++)
+					for (int dx = -1; dx <= 1; dx++) {
+						if ((dx | dy) == 0) continue;          // skip the cell itself
+						int yy = y + dy, xx = x + dx;
+						if (yy >= 0 && yy < GOL_H && xx >= 0 && xx < GOL_W)
+							n += gol_a[yy][xx];
+					}
+				gol_b[y][x] = gol_a[y][x] ? (n == 2 || n == 3) : (n == 3);
+			}
+		for (int y = 0; y < GOL_H; y++)
+			for (int x = 0; x < GOL_W; x++) { gol_a[y][x] = gol_b[y][x]; acc += gol_a[y][x]; }
+	}
+	return (uint8_t)acc;
+}
+
+// Bytecode interpreter: a data-dependent switch over 32 opcodes whose handler code
+// exceeds the 1 KB I-cache. Each dispatch is an unpredictable indirect jump (dense
+// 0..31 -> jump table) into a scattered handler -> non-sequential, cache-missing
+// fetch. This is the regime fast-read + CRM help most (README-GB3 Fetch section), and
+// the one program that misses the I-cache, so its cycle count tracks the flash mode.
+static uint8_t prog[2048];
+
+uint8_t bench_interp(void)
+{
+	seed();
+	for (int i = 0; i < 2048; i++) prog[i] = rng() & 31;   // random opcode stream
+
+	uint32_t a = 0x12345u, b = 0x9E37u, acc = 0;
+	for (uint32_t r = 0; r < 24u; r++) {
+		for (int pc = 0; pc < 2048; pc++) {
+			switch (prog[pc]) {
+				case  0: a += b;                              break;
+				case  1: a -= b;                              break;
+				case  2: a ^= b;                              break;
+				case  3: a |= b;                              break;
+				case  4: a &= b;                              break;
+				case  5: a <<= (b & 7);                       break;
+				case  6: a >>= (b & 7);                       break;
+				case  7: a += 0x9E3779B9u;                    break;
+				case  8: a *= 1000003u;                       break;
+				case  9: a = ~a;                              break;
+				case 10: a = (a << 13) | (a >> 19);           break;
+				case 11: a = (a >>  7) | (a << 25);           break;
+				case 12: b += a;                              break;
+				case 13: b ^= a;                              break;
+				case 14: b = b * 1103515245u + 12345u;        break;
+				case 15: a += (b & 0xFF);                     break;
+				case 16: a -= (b >> 3);                       break;
+				case 17: a ^= (a >> 5);                       break;
+				case 18: a += (a << 3);                       break;
+				case 19: a = a + b + (uint32_t)pc;            break;
+				case 20: a = a ^ (b + (uint32_t)pc);          break;
+				case 21: a = (a > b) ? a - b : a + b;         break;
+				case 22: a = (a & 1) ? a * 3u + 1u : a >> 1;  break;
+				case 23: a = (a & 0xFFFF) * (b & 0xFFFF);     break;
+				case 24: acc += a;                            break;
+				case 25: acc ^= a;                            break;
+				case 26: a = a - (a >> 11);                   break;
+				case 27: a += b ^ 0x5A5A5A5Au;                break;
+				case 28: b = (b << 1) ^ a;                    break;
+				case 29: a = a * a + 7u;                      break;
+				case 30: a -= acc;                            break;
+				default: a += 1u;                             break;   // opcode 31
+			}
+		}
+		acc ^= a ^ b;
+	}
+	return (uint8_t)(acc ^ a ^ b);
+}
+
 // --- the suite ----------------------------------------------------------
 
 const bench_t bench_table[] = {
@@ -330,6 +452,10 @@ const bench_t bench_table[] = {
 	{ "prime_count", 3, "div/branch",   bench_prime_count },
 	{ "fir",         3, "mul/shift",    bench_fir },
 	{ "strsearch",   3, "ld/branch",    bench_strsearch },
+	{ "interp",      3, "jump/branch",  bench_interp },
+	{ "game_of_life",3, "branch/ld-st", bench_game_of_life },
+	{ "fib_rec",     3, "call/ld-st",   bench_fib_rec },
+	{ "xorshift_mc", 3, "mul/shift",    bench_xorshift_mc },
 };
 const int bench_count = (int)(sizeof(bench_table) / sizeof(bench_table[0]));
 

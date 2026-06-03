@@ -53,7 +53,7 @@ module icebreaker (
 	SB_PLL40_PAD #(
 		.FEEDBACK_PATH("SIMPLE"),
 		.DIVR(4'b0000),
-		.DIVF(7'b0110000),
+		.DIVF(7'b0101110),
 		.DIVQ(3'b101),
 		.FILTER_RANGE(3'b001)
 	) pll (
@@ -143,7 +143,7 @@ module icebreaker (
 
 // TODO: modify the iceb chip configurations here
 	picosoc #(
-		.BARREL_SHIFTER(1),
+		.BARREL_SHIFTER(0),
 		.ENABLE_MUL(0),
 		.ENABLE_DIV(1),        // on: rv32im emits div/rem
 		.ENABLE_FAST_MUL(1),

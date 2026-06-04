@@ -161,6 +161,7 @@ module icebreaker (
 		.FLASH_INIT_MODE(3),   // 0=single(0x03) 1=dual(0xBB) 2=quad(0xEB) 3=qddr(0xED)
 		.LOOKAHEAD_DECODE(0),  // Step 1a-i: 1=register mem_ready region-select off mem_la_addr. 0=combinational default
 		.LOOKAHEAD_HIT(0),        // Step 1a-ii: 1-cycle icache hit via look-ahead pre-read
+		.REG_MEM_READY(1),     // experiment: register mem_ready (+1 wait state/txn, splits the critical chain)
 		.MEM_WORDS(MEM_WORDS)
 	) soc (
 		.clk          (clk         ),

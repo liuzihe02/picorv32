@@ -1077,10 +1077,11 @@ Built behind `LOOKAHEAD_DECODE` (default 0; plumbed `icebreaker.v` → `picosoc.
 
 **Corrected conclusion.** 1a-i is correct, free, and a modest repeatable win worth keeping — but it does **not** unlock the clock. The wall is the in-core **back half**, which needs CPU surgery (**fast-path load/store** to collapse the double memory-state visit, or **pipelining**), not SoC-decode work. Step 0 (retiming, spend the PLL margin) plausibly stacks on top of 1a-i for a bit more. **Recommendation:** keep `LOOKAHEAD_DECODE` as a default-off, A/B-testable knob; treat the back half as the next real target.
 
-**Step 2 — free experiments on the back half (flip the param, rebuild, read the delay):**
+**Step 2 — free experiments on the back half (flip the param, rebuild, read the delay):** DOESNT WORK TRIED AND TESTED
 
 - **`CATCH_MISALIGN=0`** — drops the `reg_op1[1:0]` misalign check that lives in the load/store control (plausibly near this path). Transparent for *any* compiled rv32im (it never misaligns), and saves LCs. Unverified on-path → an experiment, not a promise.
 - **`ENABLE_IRQ=0`** — the picosoc IRQ inputs are tied to 0 and compiled C can't emit the custom IRQ ops, so the IRQ FSM is dead weight that thins `cpu_state` and saves ~100 LCs. *Lower confidence:* it's a feature removal and we can't prove the unknown eval firmware won't arm IRQs — treat as optional.
+  - cuts a ton of LCs - so definitely do this tho
 
 **The wall (out of scope for a clean retime):** the back half is picorv32's `mem_done` → load/store address-calc reaction (~33 ns ≈ 30 MHz). Past it means restructuring how the multicycle FSM reacts to `mem_done` — **fast-path load/store** (collapse the double memory-state visit) or full **pipelining**. CPU surgery, a separate project. And the **DSP hard-caps ~50 MHz** regardless, so *~30 MHz clean + an eventual pipeline* is the realistic ladder.
 

@@ -80,6 +80,7 @@ module picosoc (
 	parameter [1:0] FLASH_INIT_MODE = 0; // spimemio reset read-mode: 0=single 1=dual 2=quad 3=qddr
 	parameter [0:0] LOOKAHEAD_DECODE = 0; // 0: combinational mem_ready decode (baseline); 1: register the peripheral region-select a cycle early off mem_la_addr (Step 1a-i: shortens the mem_ready critical-path front)
 	parameter [0:0] LOOKAHEAD_HIT = 0;    // 0: 2-cycle cache hit (baseline); 1: pre-read the icache EBR a cycle early off mem_la_addr (Step 1a-ii: 1-cycle hit, cpu_ready still registered)
+	parameter [0:0] REG_MEM_READY = 0;    // 0: combinational mem_ready (baseline). 1: register mem_ready/mem_rdata -> +1 wait state on EVERY memory transaction, but splits the mem_ready->reg_op1.CE critical chain (fmax vs CPI trade; experiment)
 
 	parameter integer MEM_WORDS = 256;
 	parameter [31:0] STACKADDR = (4*MEM_WORDS);       // end of memory
@@ -107,6 +108,17 @@ module picosoc (
 	wire [3:0] mem_wstrb;
 	wire [31:0] mem_rdata;
 
+	// REG_MEM_READY: one-cycle ack register on the whole responder bus. `busy` is the single
+	// ack cycle; `mem_valid_g` is the SoC's gated view of mem_valid so every responder (cache,
+	// UART, SPRAM, GPIO, cfgreg) stops the cycle after it fires -- no re-accept / double-pop.
+	// When REG_MEM_READY=0, busy=0 -> mem_valid_g == mem_valid -> byte-identical to baseline.
+	reg         ack_pending;
+	reg  [31:0] mem_rdata_q;
+	wire        mem_ready_comb;
+	wire [31:0] mem_rdata_comb;
+	wire        busy        = REG_MEM_READY && ack_pending;
+	wire        mem_valid_g = mem_valid && !busy;
+
 	// Look-ahead bus (driven by picorv32, valid one cycle before mem_valid).
 	// Used by LOOKAHEAD_DECODE to register the peripheral region-select a cycle early.
 	wire        mem_la_read;
@@ -125,7 +137,7 @@ module picosoc (
 	reg ram_ready;
 	wire [31:0] ram_rdata;
 
-	assign iomem_valid = mem_valid && (mem_addr[31:24] > 8'h 01);  // to icebreaker GPIO; stays combinational
+	assign iomem_valid = mem_valid_g && (mem_addr[31:24] > 8'h 01);  // to icebreaker GPIO; stays combinational
 	assign iomem_wstrb = mem_wstrb;
 	assign iomem_addr = mem_addr;
 	assign iomem_wdata = mem_wdata;
@@ -156,23 +168,36 @@ module picosoc (
 				dat_q   <= (mem_la_addr == 32'h 0200_0008);
 			end
 		end
-		assign iomem_sel              = iomem_q && mem_valid;
-		assign spimemio_cfgreg_sel    = cfg_q   && mem_valid;
-		assign simpleuart_reg_div_sel = div_q   && mem_valid;
-		assign simpleuart_reg_dat_sel = dat_q   && mem_valid;
+		assign iomem_sel              = iomem_q && mem_valid_g;
+		assign spimemio_cfgreg_sel    = cfg_q   && mem_valid_g;
+		assign simpleuart_reg_div_sel = div_q   && mem_valid_g;
+		assign simpleuart_reg_dat_sel = dat_q   && mem_valid_g;
 	end else begin : comb_decode
-		assign iomem_sel              = mem_valid && (mem_addr[31:24] > 8'h 01);
-		assign spimemio_cfgreg_sel    = mem_valid && (mem_addr == 32'h 0200_0000);
-		assign simpleuart_reg_div_sel = mem_valid && (mem_addr == 32'h 0200_0004);
-		assign simpleuart_reg_dat_sel = mem_valid && (mem_addr == 32'h 0200_0008);
+		assign iomem_sel              = mem_valid_g && (mem_addr[31:24] > 8'h 01);
+		assign spimemio_cfgreg_sel    = mem_valid_g && (mem_addr == 32'h 0200_0000);
+		assign simpleuart_reg_div_sel = mem_valid_g && (mem_addr == 32'h 0200_0004);
+		assign simpleuart_reg_dat_sel = mem_valid_g && (mem_addr == 32'h 0200_0008);
 	end endgenerate
 
-	assign mem_ready = (iomem_sel && iomem_ready) || cache_ready || ram_ready || spimemio_cfgreg_sel ||
+	assign mem_ready_comb = (iomem_sel && iomem_ready) || cache_ready || ram_ready || spimemio_cfgreg_sel ||
 			simpleuart_reg_div_sel || (simpleuart_reg_dat_sel && !simpleuart_reg_dat_wait);
 
-	assign mem_rdata = (iomem_sel && iomem_ready) ? iomem_rdata : cache_ready ? cache_rdata : ram_ready ? ram_rdata :
+	assign mem_rdata_comb = (iomem_sel && iomem_ready) ? iomem_rdata : cache_ready ? cache_rdata : ram_ready ? ram_rdata :
 			spimemio_cfgreg_sel ? spimemio_cfgreg_do : simpleuart_reg_div_sel ? simpleuart_reg_div_do :
 			simpleuart_reg_dat_sel ? simpleuart_reg_dat_do : 32'h 0000_0000;
+
+	// REG_MEM_READY: ack one cycle late. ack_pending is the registered comb-ready; because the
+	// responder selects are gated by !busy, mem_ready_comb falls the next cycle, so ack_pending
+	// is inherently a single-cycle pulse (no explicit one-shot needed). mem_rdata_q holds the
+	// responder's data for that ack cycle. REG off -> ack_pending stays 0, paths are combinational.
+	always @(posedge clk) begin
+		if (!resetn) ack_pending <= 0;
+		else         ack_pending <= REG_MEM_READY && mem_ready_comb;
+		mem_rdata_q <= mem_rdata_comb;
+	end
+
+	assign mem_ready = REG_MEM_READY ? ack_pending : mem_ready_comb;
+	assign mem_rdata = REG_MEM_READY ? mem_rdata_q : mem_rdata_comb;
 
 	picorv32 #(
 		.STACKADDR(STACKADDR),
@@ -214,7 +239,7 @@ module picosoc (
 		) icache0 (
 			.clk      (clk),
 			.resetn   (resetn),
-			.cpu_valid(mem_valid && mem_addr >= 4*MEM_WORDS && mem_addr < 32'h 0200_0000),
+			.cpu_valid(mem_valid_g && mem_addr >= 4*MEM_WORDS && mem_addr < 32'h 0200_0000),
 			.cpu_addr (mem_addr[23:0]),
 			.cpu_ready(cache_ready),
 			.cpu_rdata(cache_rdata),
@@ -227,7 +252,7 @@ module picosoc (
 		);
 	end else begin : nocache
 		// Bypass: CPU flash-region requests go straight to spimemio (pre-icache path).
-		assign spimem_valid = mem_valid && mem_addr >= 4*MEM_WORDS && mem_addr < 32'h 0200_0000;
+		assign spimem_valid = mem_valid_g && mem_addr >= 4*MEM_WORDS && mem_addr < 32'h 0200_0000;
 		assign spimem_addr  = mem_addr[23:0];
 		assign cache_ready  = spimem_ready;
 		assign cache_rdata  = spimem_rdata;
@@ -285,13 +310,13 @@ module picosoc (
 	);
 
 	always @(posedge clk)
-		ram_ready <= mem_valid && !mem_ready && mem_addr < 4*MEM_WORDS;
+		ram_ready <= mem_valid_g && !mem_ready && mem_addr < 4*MEM_WORDS;
 
 	`PICOSOC_MEM #(
 		.WORDS(MEM_WORDS)
 	) memory (
 		.clk(clk),
-		.wen((mem_valid && !mem_ready && mem_addr < 4*MEM_WORDS) ? mem_wstrb : 4'b0),
+		.wen((mem_valid_g && !mem_ready && mem_addr < 4*MEM_WORDS) ? mem_wstrb : 4'b0),
 		.addr(mem_addr[23:2]),
 		.wdata(mem_wdata),
 		.rdata(ram_rdata)

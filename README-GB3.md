@@ -224,6 +224,58 @@ strsearch     127429678   1568299   81.25   200   ld/branch
 done
 ```
 
+## Competition Strategy: offense & defense
+
+Each group submits a **secret benchmark** for cross-evaluation: our CPU is scored on *others'* unknown benchmarks, and ours runs on *theirs*. Many groups will build a cache-busting benchmark hoping a cache-based CPU stalls catastrophically. This is the war-game — what they can actually attack, why their best attack mostly favours *us*, and how we close the one flank that doesn't.
+
+### The battlefield is instruction fetch — data is immune
+
+The entire attack surface is the **instruction-fetch stream**. All data (`.data`/`.bss`/heap/stack) lives in 128 KB SPRAM that answers in **1 cycle regardless of footprint** — there is no D-cache to thrash. The classic killer (pointer-chase over a huge array) does nothing to us; it would wreck a group that put a small D-cache over slow memory. So every "make it fail" benchmark has exactly one lever: the **code (and `.rodata`, also flash-resident) footprint and access pattern** of `run_workload`.
+
+The build constraint bounds their *weapons* too: `-nostdlib -march=rv32im` means floats and 64-bit division emit libgcc calls that **won't link** — adversaries are confined to 32-bit-integer hardware ops + fetch patterns. On a clean board, "completely fail" means *catastrophically slow*, not *wrong* (one correctness fragility noted below).
+
+### The counterintuitive core: cache-busters favour us
+
+When a benchmark forces constant I-cache misses, **caching stops mattering for everyone** and it collapses into a pure **fetch-bandwidth contest** — which only we optimised. Most groups cached and *stopped*, leaving flash in the slow single-bit power-up mode (the example firmware never switches it). So their hardest cache-buster hurts them more than us:
+
+- our miss = qddr fetch (~4× cheaper than single-SPI); sequential misses stream cheaper still
+- their miss = ~64–128-cycle single-SPI fetch
+
+**qddr is an asymmetric moat** — the harder they make the benchmark, the more it rewards the fetch optimisation nobody else did.
+
+### Our one real flank, and the threat matrix
+
+Our genuine exposure is narrow: a footprint that fits a *bigger* competitor cache but not our **1 KB direct-mapped** one (window `(1 KB, their-cache]`), or **conflict-aliasing** into our 256 direct-mapped sets. Both stem from our cache being needlessly small — we use **7/30 EBR (23 idle)**.
+
+| Rival profile | Benchmark that beats us | Exposure |
+| --- | --- | --- |
+| Cache-only, **no fast-read** (most groups) | none fetch-bound | low — qddr moat |
+| Bigger cache **+ fast-read** | footprint in `(1 KB, their-cache]` | **medium — the real flank** |
+| **Pipelined** core | compute-bound loop that fits cache (~3 CPI us vs ~1) | high but rare |
+| **Radix-4** divider | `div`/`rem`-bomb (we're radix-2, ~40 cyc) | medium — cheap to fix |
+
+(Conflict-aliasing aside: two hot addresses 1 KB apart map to the same direct-mapped line and evict each other every iteration → 100% miss on a loop that "should" fit. The cheapest small-effort attack on a direct-mapped cache — and the reason associativity matters defensively even though it's worthless for our own 100%-hit kernels.)
+
+### Defense (priority-ordered)
+
+1. **Spend the 23 idle EBR — grow the cache.** The #1 move; our cache is small by accident, not constraint. **2-way set-associative** kills the conflict-aliasing attack; **4–8 KB capacity** collapses the footprint window; **multi-word lines** add spatial locality and amortise the per-miss `idle→check`. Keep `cpu_ready` *registered* (a combinational hit feeds the `mem_ready` critical path) and re-check fmax — LC is at 88%, EBR is free.
+2. **Radix-4 divider** — cheap insurance against the div-bomb (the only non-fetch flank).
+3. **qddr fast-read** ✅ — the moat; keep it the committed default.
+4. **Fragility note:** the cache *immortalises a transient flash-read error* (see firmware engineering log). Not adversary-triggerable through `run_workload` on a clean board, but it's the one place a cache can fail where a no-cache design self-heals.
+
+> Note the reframing vs the [Instruction cache → Further Optimizations](#further-optimizations) section: capacity/associativity is ~worthless for *our* 100%-hit kernels, but it is the *primary defense* against adversarial benchmarks. Different question, different answer.
+
+### Offense: the benchmark we submit
+
+> A **large, fetch-bound, sequential-streaming** kernel whose code footprint **exceeds the entire 15 KB EBR** — uncacheable by *anyone* — folded to a checksum.
+
+- **Footprint > 15 KB:** removes caching for everyone (incl. bigger-cache rivals), so our small cache is irrelevant and it's the pure fetch contest we win. (Sizing it just above 1 KB is a self-own — a 4 KB-cache rival fits it; go past everyone.)
+- **Sequential, not jumpy:** sequential misses stream at qddr data-phase (~4× their single-SPI), and our 1-word cache still streams cheaply through `spimemio`. Jumpy code (interpreter) pays full command+address *per jump* for us too, shrinking the edge.
+- **Fetch-bound, not compute/div-bound:** a compute-bound loop feeds pipelined rivals (~1 CPI); a div-bomb feeds radix-4 rivals. Keep per-instruction work light so *fetch* dominates — where we're unique.
+- **Differentiation:** a cache-only rival's speedup-vs-baseline ≈ **1×** (cache can't hold it, no fast-read); ours ≈ **4×** (qddr). Wins under both absolute-wall-clock and self-relative-speedup scoring.
+
+Dress it as a real kernel (large unrolled DSP/crypto pipeline, or a generated state machine) so it isn't dismissed as gaming — `bench_cold` is already this shape; scale its body past 16 KB and keep it sequential. (`bench_interp` is the jumpy cousin: a good *defensive* miss-path test, weaker *offensive* pick.)
+
 ## Design Choices
 
 ### Optimization Order
@@ -257,6 +309,7 @@ The PLL is gated on the critical path. But it's the highest-leverage lever once 
 | PLL (12 → ~18.4 MHz) | $T_c$ | low | high | low | ✅ |
 | `COMPRESSED_ISA=0` | $T_c$ | low | high | low | ✅ |
 | `TWO_CYCLE_ALU/COMPARE` + retiming | $T_c$ | low | cond. combine w/higher clock.| low | ❌ |
+| Look-ahead decode (`LOOKAHEAD_DECODE`, Step 1a-i) | $T_c$ | med | low (~+7% fmax, measured) | low | ✅ |
 | Flash fast-read (Dual/Quad/DDR; CRM parked) | fetch | low | high | low–med | ✅ |
 | Instruction cache (EBR) | fetch | med | high | med | ✅ |
 | Loop buffer | fetch | low–med | med | low | ❌ |
@@ -712,23 +765,55 @@ However,
 
 #### Further Optimizations
 
-The scored benchmarks are `while(1)` hot loops at ~100% hit after warmup, so **hit latency dominates and the miss rate is already ~0** so cutting hit latency is the optimization
+Two independent levers, and conflating them is the trap — they are *different kinds of win*:
 
-##### Cut the hit latency (2 → 1 cycle)
+- **Hit latency** — paid on *every* fetch (our hot loops are ~100% hit), so a guaranteed but *small* CPI win on every benchmark.
+- **Miss behaviour** — invisible on our own ~100%-hit proxies, but the *only* thing that matters on the worst kernel — which is exactly what the geomean, and any cache-buster a rival submits, lands on. This is the **defensive** lever; the **Competition Strategy: offense & defense** section above is the adversarial *why*, and the rest of this subsection is the *design* reasoning behind it.
 
-1. **Combinational hit response.** Drive `cpu_ready`/`cpu_rdata` combinationally in `check` (`assign cpu_ready = (state==check) && hit;`) so a hit answers at $T{+}1$ like SPRAM — halving the hit penalty. Cost: a longer combinational path (EBR-out → tag compare → `mem_ready` → CPU, through the `mem_rdata` mux), so re-check $f_{max}$ after. Highest-leverage single tweak.
+##### Hit latency (2 → 1 cycle): look-ahead, not combinational
 
-2. **Route the look-ahead interface.** picorv32 exposes `mem_la_addr`/`mem_la_read` one cycle early, but `picosoc.v` doesn't wire them to the cache (the `cpu` instance connects only `mem_valid/instr/ready/addr/wdata/wstrb/rdata`). Bringing `mem_la_*` out lets the cache start the EBR read a cycle ahead and present data the instant `mem_valid` rises — a true 1-cycle hit without the combinational-path risk of (1). Bigger change (new ports through `picosoc`), but it is how synchronous memory is meant to be driven.
+The 2-cycle hit costs ~1 cycle vs SPRAM on every fetch, but removing it is **concentrated on branches / jumps / loads / stores** — *not* uniform: ALU-op fetches are already hidden by `spimemio` prefetch, so they gain nothing. Expect a modest win on control/memory-heavy code; measure before quoting a number.
 
-##### Cut the miss rate / cost
+- **Combinational hit = trap.** `assign cpu_ready = (state==check) && hit;` answers at *T+1* like SPRAM, but it routes EBR-out → tag-compare straight into `mem_ready` — which **is the critical path** (see **Critical Path** below). It buys a CPI cycle and pays it back in clock. Avoid while `mem_ready` is the bottleneck.
+- **Look-ahead = the safe version.** Wire picorv32's `mem_la_addr`/`mem_la_read` (presented one cycle early) through `picosoc` to the cache so it pre-reads EBR a cycle ahead and answers at T+1 with `cpu_ready` still **registered** — the same 1-cycle hit, with nothing new on the critical path. It's how synchronous memory is meant to be driven, and the only hit-latency change worth making here.
 
-little effect on hot loops (already ~100% hit); helps `cold` and large straight-line code:
+##### Miss behaviour: size the cache as *insurance*
 
-3. **Multi-word lines (larger block size).** Fetch *N* words per line instead of 1, exploiting spatial locality. Since `spimemio` already *streams* sequential words cheaply (data-phase only after the first), a 4-word line amortizes the command + address + dummy over 4 words and cuts the per-miss `idle→check` overhead. ("Multi-word lines" and "bigger block size" are the same knob.)
+The scored benchmarks are unknown and the binary is **frozen** — we see neither footprint nor layout, and can't relink. So cache sizing isn't a speedup on our proxies; it's an **insurance decision on the worst kernel**, which the geomean (and a deliberate cache-buster) both target.
 
-4. **More capacity** (e.g. 4 KB / ~8 EBR vs the current 1 KB) — fewer *capacity* misses.
+**Reason about the hot working set, not the program size.** A 16 MB image with a 600 B inner loop still hits ~100% in 1 KB — the cache only sees code that runs in steady state. The danger is a large *hot* footprint, and specifically **large + jumpy** (interpreter, big `switch`, many-function loop): a large *sequential* body streams from `spimemio` at qddr data-phase even when it overflows (≈1×), but a non-sequential body pays command+address+dummy *per miss* — many-fold vs a 2-cycle hit. That is what the cache is for.
 
-5. **2-way set-associative** — fewer *conflict* misses where two hot addresses alias to the same line. Usually the better miss-rate spend than block size for a small cache.
+Each miss type maps to a hazard we can't control, and each has its *own* fix — capacity and associativity are **not interchangeable**:
+
+| Miss | Uncontrollable cause | Only real fix |
+| --- | --- | --- |
+| **Capacity** | hot footprint > cache | more capacity / multi-word lines |
+| **Conflict** | link layout — or a *deliberately* aliased benchmark | associativity (capacity only helps by luck) |
+| Compulsory | cold first touch | multi-word + fast-read |
+
+**Capacity vs associativity is a *resource* question — and our chip inverts the textbook default.** The 2:1 rule (2-way of size N ≈ direct-mapped of 2N) makes associativity look strictly better — but it's more efficient *per data-bit*, and data-bits are **EBR, which we have a surplus of**, while the scarce resource is **LC**. So for the *capacity* flank, a **bigger direct-mapped + multi-word** cache buys the robustness by spending the surplus at almost no LC — the resource-matched first move.
+
+**But the adversarial case flips 2-way back to essential.** Against *random* aliasing, a bigger direct-mapped cache (more sets) merely lowers the collision probability. Against a *constructed* attack — two hot blocks spaced exactly one cache-stride apart — a direct-mapped cache of **any size** still 100%-misses; only associativity is a structural defense. A rival can build exactly that, cheaply, so 2-way isn't "the better miss-rate spend," it's the **only** fix for the conflict flank. The two knobs therefore cover two *different* flanks: **capacity for the footprint window, associativity for the aliasing attack** — neither substitutes for the other.
+
+**Multi-word lines trade against set count.** Bigger blocks add spatial locality and amortise each miss's command+address over streamed words (direct synergy with fast-read) — but for a fixed tag budget they *reduce* the number of sets, raising conflict pressure. Fast-read makes the rarer, larger misses cheap, so it's a good trade for code; just note that leaning hard on multi-word is precisely when associativity starts earning its LC back.
+
+**Keep the cache outputs registered.** With `cpu_ready`/`cpu_rdata` registered, the EBR-read → tag-compare → way/word-mux is an internal FF→FF path *with slack* — off the `mem_ready` critical path. That one discipline is what makes capacity, ways, and block size all **fmax-safe**, and it's the same reason the combinational-hit tweak above is a trap.
+
+**Measure the sizes; don't fix them here.** The capacity / ways / words are *outputs* of measurement, not design inputs — so this spec deliberately leaves them open:
+
+- a **footprint-sweep proxy** (parameterise `bench_interp`'s handler size, or add a `bench_bigjump`) to find the *capacity knee* — where hit rate falls off a cliff;
+- a **conflict probe** (two hot regions placed exactly one cache-stride apart) to confirm whether associativity actually earns its LC over a bigger direct-mapped cache.
+
+Size to the measured knee with margin (and past a plausible rival cache — see the offense pick in **Competition Strategy**), rather than guessing.
+
+**The spec.** A parameterised read-only cache — `SETS × WAYS × WORDS_PER_LINE` exposed as params (one knob, like `ENABLE_ICACHE`), with **registered outputs**. The design commitments — the parts that are *not* up for tuning — are:
+
+1. **Grow into the idle EBR.** The current 1 KB is small by accident, not constraint; EBR is the surplus resource.
+2. **Multi-word lines.** Convert the fast-read streaming we already shipped into cheaper misses.
+3. **`WAYS` as a parameter.** Associativity becomes a measured experiment (footprint sweep vs conflict probe), turned on for the aliasing flank without a rewrite — not a default guessed up front.
+4. **Registered outputs.** Non-negotiable, to keep the whole structure off the `mem_ready` critical path.
+
+Every concrete figure that appears anywhere in this doc (4 KB? 8 KB? 2-way? 4-word lines?) is **illustrative** — the final point falls out of the sweeps above against the LC/EBR budget at the time.
 
 ### Incremental CPI reductions
 
@@ -790,7 +875,7 @@ Needs separate instruction/data paths (cache + SPRAM, distinguished by `mem_inst
 
 #### PLL
 
-The board only supplies a raw **12 MHz** crystal on the clock pad. The iCE40's hard **PLL** (`SB_PLL40_PAD`) multiplies that reference up to a faster system clock — currently **18.375 MHz**, right at the design's $f_{max}$. We retune this often, so the live value lives in `DIVF` (`icebreaker.v`) and `F_CLK_HZ` (`benchmarks.h`), not in this prose. Refer to the `SB_PLL40_PAD` code block in `icebreaker.v`:
+The board only supplies a raw **12 MHz** crystal on the clock pad. The iCE40's hard **PLL** (`SB_PLL40_PAD`) multiplies that reference up to a faster system clock — currently **~17.25 MHz** (`DIVF`=45), a touch below the ~18.5 MHz $f_{max}$ ceiling. We retune this often, so the live value lives in `DIVF` (`icebreaker.v`) and `F_CLK_HZ` (`benchmarks.h`), not in this prose. Refer to the `SB_PLL40_PAD` code block in `icebreaker.v`:
 
 ```verilog
 module icebreaker (
@@ -855,27 +940,99 @@ The achievable clock is the **minimum** of several independent limits:
 - check `icebreaker.rpt` (icetime): `Total path delay: 54.18 ns (18.46 MHz)`
 - nextpnr (print to terminal after synth) also prints `Max frequency for clock ...: 19.94 MHz (PASS at 18.38 MHz)` to stdout.
 
-**We currently run at ~18.4 MHz, right against the ~18.5 MHz critical-path ceiling** (so the clock is fully limited by the path below, not the PLL).
-- **Shorten the critical path** (`TWO_CYCLE_ALU`/`TWO_CYCLE_COMPARE` + retiming), decrease our critical path until its no longer the bottleneck to increase clock speed further. Then next bottleneck is DSP 50MHz.
+**We currently clock 17.25 MHz (`DIVF`=45) against the ~18.5 MHz critical-path ceiling** — so there's a sliver of unused PLL headroom (Step 0 in Critical Path below), and the logic path is the wall above that.
+- **Shorten the critical path** to lift the ceiling, then the next bottleneck is the DSP at 50 MHz. The lever is *not* `TWO_CYCLE_ALU` (the ALU isn't on the path) — see the [Critical Path](#critical-path) diagnosis and plan below.
 
 The payoff is large because the PLL speeds *everything* linearly in wall-clock (including flash, since SCK = clk/2). But it's **gated on critical-path work**, which is why the cache (works today) comes first and `T_c` tweaks are enablers.
 
 ##### Critical Path
 
-The actual critical path (`icebreaker.rpt`, post-route):
+The actual critical path (`icebreaker.rpt`, post-route — **54.05 ns / 18.5 MHz, 15 logic levels, routing-dominated**: the LocalMux/Span4 hops ≈1.1 ns each dwarf the ~0.7 ns LUTs):
 
 ```text
-mem_addr (DFF) → iomem_addr → iomem_ready (mem_ready decode mux) → flash_io3_di
-  → mem_xfer → mem_state → latched_store → cpu_state → instr_sw/lw/lbu (decode)
-  → reg_op1.CEN (setup)
+mem_addr[29]  (DFF, inside cpu)                                  1.5 ns  ┐ FRONT
+  → iomem_addr  (crosses out to icebreaker.v)                           │ ~21 ns
+  → iomem_ready / mem_ready OR-mux  (GPIO decode round-trips back in)   │
+  → mem_xfer   (= mem_valid & mem_ready)                        20.8 ns  ┘
+  → mem_done → ldmem/stmem control                                      ┐ BACK
+       (mem_do_prefetch, instr_sb, instr_sll ×3 …)                      │ ~33 ns
+  → reg_op1.CE  (+ the reg_op1 + decoded_imm adder)             54.0 ns  ┘
 ```
 
-That's the memory-bus **`mem_ready` / address-decode + instruction-decode** combinational cloud feeding `reg_op1`'s clock-enable — **15 logic levels, ~35 ns routing vs ~15 ns logic** (routing-dominated). The ALU (`alu_add_sub` / `alu_out`) appears **nowhere** on it.
+Two semantically distinct halves, and the split is the whole story:
 
-**Pushing past ~18.6 MHz:**
+- **Front (`mem_addr` → `mem_xfer`, ~21 ns)** — the SoC address-decode + `mem_ready` OR-mux. The worst path *starts* at the **GPIO (`iomem`) decode, which lives in `icebreaker.v`, *outside* `picosoc`** — so `mem_addr` round-trips out to the top level and back, and that cross-module hop is a big slice of the (routing-dominated) delay. The depth is the **combinational** peripheral selects (`iomem_valid`, `cfgreg_sel`, `uart_*_sel`); `cache_ready`/`ram_ready` are already FFs and cost nothing on this path.
+- **Back (`mem_xfer` → `reg_op1.CE`, ~33 ns)** — *not* generic decode: it's the **load/store address calc**. In `ldmem`/`stmem`, `reg_op1 <= reg_op1 + decoded_imm` is gated by `(!mem_do_prefetch || mem_done)`, and `mem_done` is combinational off `mem_xfer` off `mem_ready`. The chain is literally "*the prefetch just finished → so compute the data address this cycle*." The `instr_*` terms + carry are that enable cone plus the address adder.
 
-- **`TWO_CYCLE_ALU` is the wrong lever here.** It relaxes the ALU path — which isn't critical — so it wouldn't raise this `f_max` at all, just +1 cycle/ALU op for nothing.
-- **The real lever is breaking the `mem_ready` / decode chain:** the OR-mux'd `mem_ready` priority chain in `picosoc.v` (cache + GPIO `iomem_ready` + SPRAM + UART), plus picorv32's `instr_*` decode. Registering `mem_ready` (one extra wait state) or simplifying that responder/decode mux is what would move the needle — but that's a real-CPI tradeoff, not a free retiming.
+**Three facts that drive the plan:**
+
+1. It is **one** combinational FF→FF chain, so shortening *any* segment shortens the whole — front and back are not separate paths.
+2. The ALU/comparator is **nowhere** on it → `TWO_CYCLE_ALU`/`TWO_CYCLE_COMPARE` add a cycle for *nothing*.
+3. **Routing-dominated** → cutting logic *levels* helps less than moving logic onto FFs (so the router places it freely) and killing the cross-module round-trip.
+
+###### Plan — shorten it
+
+Re-read `Total path delay` after **every** step: the wall moves, and PnR placement is nondeterministic, so the frequencies below are *estimates*, not promises.
+
+> **Verify correctness, not just fmax.** A structural change touches the memory handshake, so after each step rebuild the firmware and `make icebsim`: the testbench's trap detector must stay silent and the benchmark checksums must still match the known-good column above (`bench_matmul` = 204, etc.). For the Step 1 decode rework, write a focused `mem_ready`/look-ahead testbench (drive `mem_la_*`/`mem_valid` sequences, check `mem_ready`/`mem_rdata` route to the same responder as the baseline) before trusting the board. fmax (`icetime`) and correctness (`icebsim` + tb) are *both* gates.
+
+**Step 0 — free, zero-RTL (do first; they also recalibrate the true ceiling):**
+
+- **Seed sweep** (`nextpnr --seed`) — *already tried* (placement is nondeterministic; a few seeds buy a few %).
+- **Register retiming** (`synth_ice40 -retime`) — let abc rebalance FFs across the cloud. Untried, free.
+- **Spend the PLL-to-closure margin** — we clock **17.25 MHz** against an ~18.5 MHz (icetime) / ~19.9 MHz (nextpnr) ceiling. If that gap is spendable, nudge `DIVF` toward ~18.4 (free ~7%) — but re-confirm it still P&Rs (we may sit at 17.25 *because* it closes reliably).
+
+**Step 1 — the structural clock win: get the address decode out of the `mem_ready` chain.** Two routes to the same goal — a shallow `mem_ready` = OR of flip-flops, with the peripheral address-compares (and the combinational GPIO decode that currently round-trips through `icebreaker.v`) off the path. **Step 1a is preferred**; 1b is the lighter fallback if 1a's wiring proves too invasive.
+
+**Build it behind a default-off knob** (same convention as `ENABLE_ICACHE`/`FLASH_INIT_MODE`): a param plumbed `icebreaker.v` → `picosoc.v` (e.g. `LOOKAHEAD_DECODE`) that defaults to today's combinational decode, so the verified baseline stays byte-identical and the new path is A/B-testable for fmax vs. CPI from one line in `icebreaker.v`.
+
+- **Step 1a — Look-ahead pre-decode (*preferred*).** Route picorv32's `mem_la_addr`/`mem_la_read` into `picosoc` (already driven by the core; `picosoc.v` just doesn't wire them) — a tiny **shared prerequisite**, then two *independent* pieces build on it. They touch different modules, target different metrics, and carry different risk, so do them **one at a time and verify after each** (don't bundle — a bundled gain/regression is un-attributable):
+
+  - **1a-i — decode fix (✅ done; the modest fmax win).** Off the look-ahead address, **register a one-hot region-select a cycle early**, so `mem_ready` becomes an FF-select with **no wait state** (the look-ahead address is valid the cycle before `mem_valid` → transactions stay 1-cycle, no double-write hazard). Shortens the critical-path front — *estimated* ~21 → ~5 ns; **measured ~20 → ~13 ns**, a real but small win because the back half dominates (full results + corrected conclusion below). Lives in `picosoc.v`; lower risk. *(The "no wait state" claim rests on the timing assumption below — verified in `lookahead_tb.v`.)*
+  - **1a-ii — cache 1-cycle hit (a CPI bonus, do second, separate change).** The same `mem_la_*` wiring lets `icache` **pre-read its EBR off `mem_la_addr`** and answer a hot-loop hit in 1 cycle instead of 2 (~6.4 → ~5.x CPI), with `cpu_ready` still *registered* — **not** the rejected combinational hit. Lives in `icache.v`; riskier (it changes the hot-loop hit FSM — the path the I-cache *freeze* log was about). After landing it, **re-measure fmax** to prove the pre-read didn't claw the path back (it shouldn't — `cpu_ready` stays an FF — but verify).
+
+  Cost: a few new ports through `picosoc` (prereq + 1a-i), plus `icache` for 1a-ii. This is what the look-ahead interface is *for*.
+
+> **Load-bearing assumption (verify, don't assume):** the "no wait state" claim requires `mem_la_read`/`mem_la_write` to lead `mem_valid` by *exactly one cycle for every transaction*, so the region-select registered off `mem_la_addr` matches the address `mem_valid` actually presents next cycle. This holds for `COMPRESSED_ISA=0` (no RVC prefetched-high-word replay), but **confirm it in sim** — a mismatch routes a transaction to the wrong responder. Also reproduce the existing decode's **region overlap/priority exactly**: `iomem_valid` (`addr[31:24] > 0x01`) covers *both* `0x02` (cfgreg/UART, exact-match selects) and `0x03` (GPIO), so the pre-decode must keep the same precedence (exact `0x0200_000x` selects beat the broad `> 0x01` iomem catch-all).
+
+- **Step 1b — Register the cold responders (*lighter fallback*).** Make cfgreg/UART return a *registered* `ready`/`rdata` (GPIO already does, via its `!iomem_ready` guard), dropping their compares off the chain. ~0 CPI — the kernels never touch those peripherals (`time_benchmark` brackets only `fn()`). **Caveat — it's reads, not writes:** the added wait state makes the registered `ready` land a cycle *after* select, so a *read* must **latch the responder's `rdata` at select-time** — `simpleuart` self-clears `recv_buf_valid` on `reg_dat_re`, so a late capture returns `~0` (empty) instead of the byte. (Writes are already safe: GPIO's `!iomem_ready` guard, the UART's `send_bitcnt` guard, idempotent cfgreg — there's no double-write.) Only the interactive menu hits these (the scored kernels touch no peripheral), but it must still work. This whole class of gotcha is *why 1a is preferred*: pre-registering only the select keeps peripherals 1-cycle, so nothing changes latency.
+
+~~Estimate: front ~21 → ~5 ns ⇒ ~38 ns ≈ **~26 MHz**.~~ **Superseded by measurement — see below.**
+
+###### ✅ Implemented + measured (1a-i)
+
+Built behind `LOOKAHEAD_DECODE` (default 0; plumbed `icebreaker.v` → `picosoc.v`): wire the core's `mem_la_addr`/`mem_la_read`/`mem_la_write` into `picosoc` and register the one-hot peripheral region-select a cycle early off `mem_la_addr`. Files touched: `picosoc.v` (ports + the generate-selected decode), `icebreaker.v` (param). **1a-ii (cache 1-cycle hit) is NOT done** — deferred pending the conclusion below. Knob-off stays byte-identical to baseline.
+
+**Correctness** — `picosoc/lookahead_tb.v` runs the SoC with the knob on and asserts, on **every** `mem_valid` cycle, that the registered region-select equals the *true* combinational decode of the address actually presented (this is the direct test of the load-bearing 1-cycle-lead assumption + the region overlap/priority). Result: boots, no trap, **793,681 checks all matched**, with cfgreg (`S`) / UART-echo / GPIO exercised. Knob-off rebuild = baseline `SIM PASS`. Build it by swapping `lookahead_tb.v` for `icebreaker_tb.v` in the `iverilog` line; on-board, still confirm `bench_matmul`=204 etc.
+
+**fmax** (`nextpnr --seed 1..5 --freq 40`, the ICACHE + qddr config, seed-matched A/B):
+
+| | baseline | 1a-i | Δ |
+| --- | ---: | ---: | ---: |
+| mean of 5 seeds | 19.33 MHz | **20.54 MHz** | **+6.3%** |
+| best seed | 19.63 MHz | **21.41 MHz** | **+9.1%** |
+
+1a-i wins **every** seed, at **zero CPI cost** — but it is a **~+7% trim, not the ~26 MHz first estimated.** Why the estimate was wrong (post-route `icetime`/`nextpnr` evidence):
+
+- The front *did* shrink — `mem_addr → mem_xfer` went ~20 → ~13 ns, and the path no longer *starts* at `mem_addr` (the `mem_addr→decode` cone is gone; it now starts at the `iomem_ready` FF). So the mechanism works.
+- **But it is one continuous FF→FF chain**, and the dominant part is the **back half** — `mem_xfer` → `mem_do_*` → decoder → `instr_sll` cascade → `reg_op1.CE`, **~33–42 ns**, entirely inside `picorv32`. 1a-i doesn't touch it.
+- The front was never ~21 ns of *removable* delay: ~13 ns of it (the cross-module `iomem_ready` arrival + the `mem_ready` OR + the `mem_xfer` fan-out) survives, and the back dominates the total either way.
+- **Seed placement noise on the back (~±4 MHz) exceeds the front saving (~+1.2 MHz mean)** — so a single seed can read as ~0 (seed 1: +1.4%) while the 5-seed mean is a clean +6.3%. The mean is the honest figure.
+
+**Corrected conclusion.** 1a-i is correct, free, and a modest repeatable win worth keeping — but it does **not** unlock the clock. The wall is the in-core **back half**, which needs CPU surgery (**fast-path load/store** to collapse the double memory-state visit, or **pipelining**), not SoC-decode work. Step 0 (retiming, spend the PLL margin) plausibly stacks on top of 1a-i for a bit more. **Recommendation:** keep `LOOKAHEAD_DECODE` as a default-off, A/B-testable knob; treat the back half as the next real target.
+
+**Step 2 — free experiments on the back half (flip the param, rebuild, read the delay):**
+
+- **`CATCH_MISALIGN=0`** — drops the `reg_op1[1:0]` misalign check that lives in the load/store control (plausibly near this path). Transparent for *any* compiled rv32im (it never misaligns), and saves LCs. Unverified on-path → an experiment, not a promise.
+- **`ENABLE_IRQ=0`** — the picosoc IRQ inputs are tied to 0 and compiled C can't emit the custom IRQ ops, so the IRQ FSM is dead weight that thins `cpu_state` and saves ~100 LCs. *Lower confidence:* it's a feature removal and we can't prove the unknown eval firmware won't arm IRQs — treat as optional.
+
+**The wall (out of scope for a clean retime):** the back half is picorv32's `mem_done` → load/store address-calc reaction (~33 ns ≈ 30 MHz). Past it means restructuring how the multicycle FSM reacts to `mem_done` — **fast-path load/store** (collapse the double memory-state visit) or full **pipelining**. CPU surgery, a separate project. And the **DSP hard-caps ~50 MHz** regardless, so *~30 MHz clean + an eventual pipeline* is the realistic ladder.
+
+**Rejected (with the report as the evidence):**
+
+- **Register `mem_ready` wholesale** — cuts the chain but taxes *every* fetch/load/store with a wait state (~1.2× CPI) and undoes the cache win. Step 1 gets most of the gain without the tax, because peripherals are free to slow down but memory is not.
+- **Combinational cache hit** (drive `cpu_ready` combinationally on a hit) — feeds `cache_ready` straight *into the `mem_ready` front-half mux that is the bottleneck*; it lengthens the binding path. Use the look-ahead 1-cycle hit (1a) instead.
+- **`TWO_CYCLE_ALU`/`TWO_CYCLE_COMPARE`** — the ALU is nowhere on the path; pure CPI loss.
 
 ### Power and Area (alternative targets)
 

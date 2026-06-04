@@ -47,7 +47,7 @@ module testbench;
 		$dumpfile("testbench.vcd");
 		$dumpvars(0, testbench);
 
-		repeat ($test$plusargs("stim") ? 120 : 6) begin
+		repeat ($test$plusargs("stim") ? 120 : 20) begin
 			repeat (50000) @(posedge clk);
 			$display("+50000 cycles");
 		end

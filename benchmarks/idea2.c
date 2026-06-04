@@ -5,6 +5,8 @@
 
 #define SPRAM_ELEM_COUNT 16384  // 64 KB SPRAM array
 #define SEARCH_ELEM_COUNT 1024  // Reduced size so data structures don't overflow small memory footprint
+#define reg_leds (*(volatile uint8_t*)0x03000000)
+#define reg_7seg (*(volatile uint8_t*)0x03000001)
 
 static volatile uint32_t spram_data[SPRAM_ELEM_COUNT];
 static volatile uint32_t sorted_data[SEARCH_ELEM_COUNT];
@@ -72,4 +74,16 @@ unsigned char run_workload(void)
     // Fold all independent execution paths into a single returned checksum byte
     uint32_t final_chk = x ^ lcg_state ^ spram_accumulator ^ branch_accumulator;
     return (unsigned char)(final_chk ^ (final_chk >> 8) ^ (final_chk >> 16) ^ (final_chk >> 24));
+}
+
+void main(){
+  // all required setup
+  // ...
+  unsigned char leds_value = 0x02;
+  while (1) {
+    // calculation that produces a unique answer
+    reg_7seg = run_workload(); // display
+    reg_leds = leds_value;
+    leds_value = leds_value ^ 0x02; // toggle LED1
+  }
 }

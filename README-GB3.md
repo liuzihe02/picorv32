@@ -258,7 +258,7 @@ Our genuine exposure is narrow: a footprint that fits a *bigger* competitor cach
 
 ### Defense (priority-ordered)
 
-1. **Spend the 23 idle EBR — grow the cache.** The #1 move; our cache is small by accident, not constraint. **2-way set-associative** kills the conflict-aliasing attack; **4–8 KB capacity** collapses the footprint window; **multi-word lines** add spatial locality and amortise the per-miss `idle→check`. Keep `cpu_ready` *registered* (a combinational hit feeds the `mem_ready` critical path) and re-check fmax — LC is at 88%, EBR is free.
+1. **Spend the 23 idle EBR — grow the cache.** The #1 move; our cache is small by accident, not constraint — capacity collapses the footprint window, associativity kills the aliasing attack. Design + staged rollout: [Further Optimizations → Implementation plan](#further-optimizations).
 2. **Radix-4 divider** — cheap insurance against the div-bomb (the only non-fetch flank).
 3. **qddr fast-read** ✅ — the moat; keep it the committed default.
 4. **Fragility note:** the cache *immortalises a transient flash-read error* (see firmware engineering log). Not adversary-triggerable through `run_workload` on a clean board, but it's the one place a cache can fail where a no-cache design self-heals.
@@ -814,6 +814,61 @@ Size to the measured knee with margin (and past a plausible rival cache — see 
 4. **Registered outputs.** Non-negotiable, to keep the whole structure off the `mem_ready` critical path.
 
 Every concrete figure that appears anywhere in this doc (4 KB? 8 KB? 2-way? 4-word lines?) is **illustrative** — the final point falls out of the sweeps above against the LC/EBR budget at the time.
+
+##### Implementation plan
+
+Realise the spec as **one** module — `icache.v` rewritten geometry- *and* latency-parametric — so capacity, associativity, line size, and the 1-cycle hit are all the *same* design, swept not rewritten. The defaults reproduce today's cache **byte-identical**, so the whole ladder lives behind `ENABLE_ICACHE`, A/B-testable and revertible one param at a time.
+
+**Parameters** (powers of two; plumbed `icebreaker.v` → `picosoc.v` → `icache`):
+
+| Param | Default (= today) | Meaning |
+| --- | :-: | --- |
+| `SETS` | 256 | index entries |
+| `WAYS` | 1 | associativity (1 = direct-mapped) |
+| `WORDS_PER_LINE` | 1 | words per line (spatial locality / streamed-miss amortisation) |
+| `LOOKAHEAD_HIT` | 0 | 1 ⇒ pre-read EBR off `mem_la_addr` ⇒ 1-cycle hit (the look-ahead lever above), `cpu_ready` still registered |
+
+Capacity = `SETS × WAYS × WORDS_PER_LINE` words × 4 B (today 256·1·1 = 1 KB).
+
+**Derived address split** — all `localparam` off the params, so one edit re-slices everything. With `i = log2(SETS)`, `w = log2(WORDS_PER_LINE)` on `cpu_addr[23:0]`:
+
+```text
+ tag [23 : 2+i+w] | index [1+i+w : 2+w] | word [1+w : 2] | byte [1:0]
+```
+
+Defaults (`i=8, w=0`) give `tag[23:10] | index[9:2] | byte[1:0]` — exactly today, so Stage 0 is provably a no-op.
+
+**Storage & EBR cost** (yosys infers `SB_RAM40_4K`: 4 Kbit, ≤16-bit wide ⇒ a 32-bit word spans 2 blocks, 256 deep each). Use these to size a config into the **23 idle EBR** (but **LC is the real ceiling — 88%** — so re-read nextpnr LC after every stage):
+
+- data: `SETS·WAYS·WORDS_PER_LINE` words ⇒ `ceil(words/256) × 2` EBR.
+- tag+valid: `SETS·WAYS` entries × `(1+tag)` bits ⇒ `ceil(entries/256) × ceil((1+tag)/16)` EBR.
+- **multi-word is the EBR-cheap capacity** (fewer tags per word): 4 KB as 256·1·**4** = 8 data + **1** tag EBR, vs 4 KB as 1024·1·1 = 8 data + **4** tag EBR.
+
+**Read / hit path** (registered out — keeps the EBR-read→compare→way/word-mux an internal FF→FF path with slack, off `mem_ready`):
+
+1. read all `WAYS` tags + the offset-selected word of each way in parallel — off the **look-ahead** index when `LOOKAHEAD_HIT`, else off `cpu_addr` (the current 2-cycle path);
+2. compare the `WAYS` tags against the **actual `cpu_addr` tag** (never the staged tag — a stale pre-read can then only *miss*, never false-hit: the freeze-mode guard);
+3. one-hot way-select → `WORDS_PER_LINE:1` word-mux → `cpu_rdata`; assert registered `cpu_ready`.
+
+**Replacement** (`WAYS>1`): one **use-bit per set** for 2-way (evict the not-recently-used way; flip on hit/fill — `SETS` FFs). Stay 2-way unless the conflict probe demands more (then tree-PLRU). Direct-mapped: none.
+
+**Miss / fill (multi-word, rides the shipped fast-read):** stream `WORDS_PER_LINE` sequential words from `spimemio` (increment `spi_addr` — the cheap data-phase burst), write them into the victim way's line, set its tag valid + update the use-bit, ack. Start with *fill-line-then-ack*; critical-word-first is an optional latency tweak.
+
+**EBR-reset sweep** generalises unchanged: clear every `(set, way)` valid bit after reset before the first lookup (silicon powers up undefined).
+
+**Staged rollout — one param per stage, verify + measure after each** (never bundle; an un-attributable gain/regression is the whole trap):
+
+| Stage | Flip | What it buys | Gate |
+| :-: | --- | --- | --- |
+| 0 | refactor to parametric, defaults = today | nothing (safety net) | boot/trap + checksums **byte-identical** to baseline |
+| 1 | grow `SETS` (e.g. 4 KB direct) | capacity flank | fmax + **LC** |
+| 2 | `WORDS_PER_LINE` = 2/4 | cheaper `cold`/`interp` misses | set-count vs conflict |
+| 3 | `WAYS` = 2 + use-bit | conflict/aliasing flank | LC, fmax |
+| 4 | `LOOKAHEAD_HIT` = 1 | hot-loop CPI (every benchmark) | `cpu_ready` stays FF; re-check fmax |
+
+> **Verification** (each stage): defaults/knob-off rebuild stays baseline `SIM PASS`; boot trap-silent + on-board checksums (`matmul`=204 …); new `cache_tb.v` asserts **no false-hit** (a hit's `cpu_rdata` equals the word `spimemio` holds for that line), **hit latency** = 1 with `LOOKAHEAD_HIT` (else 2), and correct multi-word fill; drive the **footprint-sweep** + **conflict-probe** proxies to *place* the geometry; re-run `lookahead_tb` (decode unaffected) and re-read fmax + LC. Full-count checksums confirmed on-board.
+
+**Files:** `icache.v` (parametric rewrite), `picosoc.v` (params + `mem_la_*` wiring, shared with Step 1a-i), `icebreaker.v` (top knobs), `cache_tb.v` (new).
 
 ### Incremental CPI reductions
 

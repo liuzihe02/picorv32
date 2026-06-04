@@ -15,14 +15,17 @@
 // At -O0 each OP expands to load/shift/xor/store, so the unrolled body blows
 // past the cache and pays the flash-fetch penalty per instruction.
 // -----------------------------------------------------------------------------
-#define OP(a)    a ^= (a << 13); a ^= (a >> 17); a ^= (a << 5);
-#define OP10(a)  OP(a) OP(a) OP(a) OP(a) OP(a) OP(a) OP(a) OP(a) OP(a) OP(a)
-#define OP100(a) OP10(a) OP10(a) OP10(a) OP10(a) OP10(a) OP10(a) OP10(a) OP10(a) OP10(a) OP10(a)
+#define COLD1(x)  x = x * 1000003u + 0x9E37u;
+#define COLD4(x)  COLD1(x) COLD1(x) COLD1(x) COLD1(x)
+#define COLD16(x) COLD4(x) COLD4(x) COLD4(x) COLD4(x)
+#define COLD64(x) COLD16(x) COLD16(x) COLD16(x) COLD16(x)
+#define COLD256(x) COLD64(x) COLD64(x) COLD64(x) COLD64(x)
 
-static uint32_t bm1_capacity_crusher(uint32_t seed) {
-    uint32_t val = seed;
-    OP100(val); OP100(val); OP100(val); OP100(val);
-    return val;
+uint8_t bench_cold_fetch(void)  // large straight-line body -> footprint > cache
+{
+	uint32_t x = 0xABCDEFu, acc = 0;
+	for (uint32_t r = 0; r < 500u; r++) { COLD256(x) COLD256(x) COLD256(x) COLD256(x) acc ^= x; }
+	return (uint8_t)(acc ^ x);
 }
 
 // -----------------------------------------------------------------------------
@@ -100,7 +103,7 @@ unsigned char run_workload(void) {
     for (int i = 0; i < SEARCH_ELEM_COUNT; i++)
         sorted_data[i] = (uint32_t)i * 2;
 
-    chk ^= bm1_capacity_crusher(0xCAFEBABEu);
+    bench_cold_fetch();
     chk ^= bm2_linear_mult(0x12345678u);
     chk ^= bm3_random_accessor();
     chk ^= bm4_branch_heavy();

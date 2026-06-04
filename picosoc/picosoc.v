@@ -78,6 +78,7 @@ module picosoc (
 	parameter [0:0] ENABLE_IRQ_QREGS = 0;
 	parameter [0:0] ENABLE_ICACHE = 1;   //default icache on
 	parameter [1:0] FLASH_INIT_MODE = 0; // spimemio reset read-mode: 0=single 1=dual 2=quad 3=qddr
+	parameter [0:0] LOOKAHEAD_DECODE = 0; // 0: combinational mem_ready decode (baseline); 1: register the peripheral region-select a cycle early off mem_la_addr (Step 1a-i: shortens the mem_ready critical-path front)
 
 	parameter integer MEM_WORDS = 256;
 	parameter [31:0] STACKADDR = (4*MEM_WORDS);       // end of memory
@@ -105,6 +106,12 @@ module picosoc (
 	wire [3:0] mem_wstrb;
 	wire [31:0] mem_rdata;
 
+	// Look-ahead bus (driven by picorv32, valid one cycle before mem_valid).
+	// Used by LOOKAHEAD_DECODE to register the peripheral region-select a cycle early.
+	wire        mem_la_read;
+	wire        mem_la_write;
+	wire [31:0] mem_la_addr;
+
 	wire        spimem_valid;
 	wire [23:0] spimem_addr;
 	wire        spimem_ready;
@@ -117,25 +124,52 @@ module picosoc (
 	reg ram_ready;
 	wire [31:0] ram_rdata;
 
-	assign iomem_valid = mem_valid && (mem_addr[31:24] > 8'h 01);
+	assign iomem_valid = mem_valid && (mem_addr[31:24] > 8'h 01);  // to icebreaker GPIO; stays combinational
 	assign iomem_wstrb = mem_wstrb;
 	assign iomem_addr = mem_addr;
 	assign iomem_wdata = mem_wdata;
 
-	wire spimemio_cfgreg_sel = mem_valid && (mem_addr == 32'h 0200_0000);
 	wire [31:0] spimemio_cfgreg_do;
-
-	wire        simpleuart_reg_div_sel = mem_valid && (mem_addr == 32'h 0200_0004);
 	wire [31:0] simpleuart_reg_div_do;
-
-	wire        simpleuart_reg_dat_sel = mem_valid && (mem_addr == 32'h 0200_0008);
 	wire [31:0] simpleuart_reg_dat_do;
 	wire        simpleuart_reg_dat_wait;
 
-	assign mem_ready = (iomem_valid && iomem_ready) || cache_ready || ram_ready || spimemio_cfgreg_sel ||
+	// Peripheral region selects feeding mem_ready / mem_rdata (the critical-path FRONT).
+	//   LOOKAHEAD_DECODE=0 : combinational decode of mem_addr (baseline, byte-identical).
+	//   LOOKAHEAD_DECODE=1 : one-hot region-select registered one cycle early off mem_la_addr,
+	//     so mem_ready becomes an OR of flip-flops -- the mem_addr compares and the cross-module
+	//     GPIO round-trip leave the mem_valid-cycle path. No wait state: mem_la_addr is valid the
+	//     cycle before mem_valid, so the select is ready exactly when mem_valid asserts.
+	wire iomem_sel, spimemio_cfgreg_sel, simpleuart_reg_div_sel, simpleuart_reg_dat_sel;
+
+	generate if (LOOKAHEAD_DECODE) begin : la_decode
+		reg iomem_q, cfg_q, div_q, dat_q;
+		wire la_req = mem_la_read || mem_la_write;
+		always @(posedge clk) begin
+			if (!resetn) begin
+				iomem_q <= 0; cfg_q <= 0; div_q <= 0; dat_q <= 0;
+			end else if (la_req) begin   // latch on the look-ahead pulse; hold across wait states
+				iomem_q <= (mem_la_addr[31:24] > 8'h 01);
+				cfg_q   <= (mem_la_addr == 32'h 0200_0000);
+				div_q   <= (mem_la_addr == 32'h 0200_0004);
+				dat_q   <= (mem_la_addr == 32'h 0200_0008);
+			end
+		end
+		assign iomem_sel              = iomem_q && mem_valid;
+		assign spimemio_cfgreg_sel    = cfg_q   && mem_valid;
+		assign simpleuart_reg_div_sel = div_q   && mem_valid;
+		assign simpleuart_reg_dat_sel = dat_q   && mem_valid;
+	end else begin : comb_decode
+		assign iomem_sel              = mem_valid && (mem_addr[31:24] > 8'h 01);
+		assign spimemio_cfgreg_sel    = mem_valid && (mem_addr == 32'h 0200_0000);
+		assign simpleuart_reg_div_sel = mem_valid && (mem_addr == 32'h 0200_0004);
+		assign simpleuart_reg_dat_sel = mem_valid && (mem_addr == 32'h 0200_0008);
+	end endgenerate
+
+	assign mem_ready = (iomem_sel && iomem_ready) || cache_ready || ram_ready || spimemio_cfgreg_sel ||
 			simpleuart_reg_div_sel || (simpleuart_reg_dat_sel && !simpleuart_reg_dat_wait);
 
-	assign mem_rdata = (iomem_valid && iomem_ready) ? iomem_rdata : cache_ready ? cache_rdata : ram_ready ? ram_rdata :
+	assign mem_rdata = (iomem_sel && iomem_ready) ? iomem_rdata : cache_ready ? cache_rdata : ram_ready ? ram_rdata :
 			spimemio_cfgreg_sel ? spimemio_cfgreg_do : simpleuart_reg_div_sel ? simpleuart_reg_div_do :
 			simpleuart_reg_dat_sel ? simpleuart_reg_dat_do : 32'h 0000_0000;
 
@@ -161,6 +195,9 @@ module picosoc (
 		.mem_wdata   (mem_wdata  ),
 		.mem_wstrb   (mem_wstrb  ),
 		.mem_rdata   (mem_rdata  ),
+		.mem_la_read (mem_la_read ),
+		.mem_la_write(mem_la_write),
+		.mem_la_addr (mem_la_addr ),
 		.irq         (irq        )
 	);
 

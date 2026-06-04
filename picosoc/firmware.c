@@ -371,12 +371,8 @@ void cmd_read_flash_regs()
 
 // --------------------------------------------------------
 
-// The scored workload: the ONE benchmark wired to the LED1 scope loop
-// (run_scope). Change this single line to pick which benchmark is scored.
-unsigned char run_workload(void)
-{
-	return bench_matmul();
-}
+// The scored workload lives in benchmarks/idea1.c (timed by run_scope / [B]).
+extern unsigned char run_workload(void);
 
 // Scope run: loop the workload forever, timing each pass and toggling LED1 for the Picoscope.
 // Prints cycles / instrs / CPI over UART. Stops on a key.

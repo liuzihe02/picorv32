@@ -1,95 +1,78 @@
+// idea1.c -- scored workload for the GB3 RISC-V benchmark harness.
+//
+// Defines run_workload(): runs four micro-benchmarks back to back and folds
+// every result into a returned checksum byte (so the optimiser can't delete
+// the work). picosoc/firmware.c's run_scope()/[B] menu times this via
+// time_benchmark() and prints cycles / instrs / CPI / ms over UART.
+//
+// Built at -O0 (the Makefile sets no -O flag) and -march=rv32im, which is what
+// the "code bloat" assumptions below rely on.
+
 #include <stdint.h>
 
 // -----------------------------------------------------------------------------
-// Hardware Cycle Counter
+// Benchmark 1: Capacity Crusher -- thrash the 1 KB I-cache, highlight QSPI.
+// At -O0 each OP expands to load/shift/xor/store, so the unrolled body blows
+// past the cache and pays the flash-fetch penalty per instruction.
 // -----------------------------------------------------------------------------
-static inline uint32_t get_cycles() {
-    uint32_t cycles;
-    asm volatile ("rdcycle %0" : "=r" (cycles));
-    return cycles;
-}
-
-// -----------------------------------------------------------------------------
-// Benchmark 1: The Capacity Crusher (Thrash 8KB caches, highlight QSPI)
-// -----------------------------------------------------------------------------
-// At -O0, these macros will generate immense code bloat. Each OP will compile 
-// into multiple instructions (load from stack, shift, xor, store to stack). 
-// This guarantees we instantly blow past their 8KB cache limit, forcing them 
-// into a 60-cycle SPI penalty per instruction, while you pay ~8 cycles via QSPI.
-#define OP(a)   a ^= (a << 13); a ^= (a >> 17); a ^= (a << 5);
-#define OP10(a) OP(a) OP(a) OP(a) OP(a) OP(a) OP(a) OP(a) OP(a) OP(a) OP(a)
+#define OP(a)    a ^= (a << 13); a ^= (a >> 17); a ^= (a << 5);
+#define OP10(a)  OP(a) OP(a) OP(a) OP(a) OP(a) OP(a) OP(a) OP(a) OP(a) OP(a)
 #define OP100(a) OP10(a) OP10(a) OP10(a) OP10(a) OP10(a) OP10(a) OP10(a) OP10(a) OP10(a) OP10(a)
 
-uint32_t bm1_capacity_crusher(uint32_t seed) {
+static uint32_t bm1_capacity_crusher(uint32_t seed) {
     uint32_t val = seed;
-    OP100(val);
-    OP100(val);
-    OP100(val);
-    OP100(val);
+    OP100(val); OP100(val); OP100(val); OP100(val);
     return val;
 }
 
 // -----------------------------------------------------------------------------
-// Benchmark 2: Linear Multiplication (Highlight 1KB I-Cache + Fast MUL)
+// Benchmark 2: Linear Multiplication -- tiny loop body (fits the I-cache),
+// back-to-back multiplies to highlight fast MUL.
 // -----------------------------------------------------------------------------
-// Nested matrix loops are terrible at -O0 due to stack-thrashing loop counters.
-// To highlight Fast-MUL, we use a flattened loop executing a polynomial hash 
-// (similar to MurmurHash). This keeps the instruction footprint tiny (fits in 
-// your 1KB cache) and forces consecutive 'mul' instructions.
 #define HASH_ITERATIONS 2048
 
-uint32_t bm2_linear_mult(uint32_t input) {
+static uint32_t bm2_linear_mult(uint32_t input) {
     uint32_t h = input;
-    // A single, simple loop minimizes -O0 stack overhead while maximizing math
     for (int i = 0; i < HASH_ITERATIONS; i++) {
-        h *= 0xcc9e2d51;
+        h *= 0xcc9e2d51u;
         h = (h << 15) | (h >> 17);
-        h *= 0x1b873593;
+        h *= 0x1b873593u;
         h ^= h >> 16;
-        h *= 0x85ebca6b;
+        h *= 0x85ebca6bu;
     }
     return h;
 }
 
 // -----------------------------------------------------------------------------
-// Benchmark 3: SPRAM Random Accessor (Thrash D-Caches, highlight raw SPRAM)
+// Benchmark 3: SPRAM Random Accessor -- sparse random R-M-W over a 64 KB array
+// to stress data memory; raw 1-cycle SPRAM should dominate.
+// static (BSS in SPRAM), not on the stack. volatile so accesses aren't elided.
 // -----------------------------------------------------------------------------
-// At -O0, their D-Cache is already stressed by stack variables. By adding 
-// 64KB of sparse, random array accesses, their D-Cache will completely fail.
-// Your 1-cycle bypass directly to SPRAM will dominate this test.
-#define SPRAM_ELEM_COUNT 16384 // 64KB Array
-volatile uint32_t spram_data[SPRAM_ELEM_COUNT];
+#define SPRAM_ELEM_COUNT 16384  // 64 KB
+static volatile uint32_t spram_data[SPRAM_ELEM_COUNT];
 
-void bm3_random_accessor() {
-    uint32_t lcg_state = 123456789;
-    
+static uint32_t bm3_random_accessor(void) {
+    uint32_t lcg_state = 123456789u;
     for (int i = 0; i < 4096; i++) {
-        // Pseudo-random index generation
-        lcg_state = (1103515245 * lcg_state + 12345) & 0x7FFFFFFF;
+        lcg_state = (1103515245u * lcg_state + 12345u) & 0x7FFFFFFF;
         uint32_t idx = lcg_state % SPRAM_ELEM_COUNT;
-        
-        // Read, modify, write to a random location
-        spram_data[idx] = spram_data[idx] ^ 0xDEADBEEF;
+        spram_data[idx] = spram_data[idx] ^ 0xDEADBEEFu;
     }
+    return lcg_state ^ spram_data[lcg_state % SPRAM_ELEM_COUNT];
 }
 
 // -----------------------------------------------------------------------------
-// Benchmark 4: Branch-Heavy State Machine (Defeat Look-Ahead/Prefetchers)
+// Benchmark 4: Branch-Heavy Search -- unpredictable binary searches to defeat
+// prefetch / look-ahead.
 // -----------------------------------------------------------------------------
-// Unpredictable branches remain unpredictable regardless of optimization level.
-// When the branch fails, their prefetcher flushes and pays a 60-cycle penalty. 
-// You only pay an 8-cycle penalty.
 #define SEARCH_ELEM_COUNT 4096
-volatile uint32_t sorted_data[SEARCH_ELEM_COUNT];
+static volatile uint32_t sorted_data[SEARCH_ELEM_COUNT];
 
-int binary_search(uint32_t target) {
-    int left = 0;
-    int right = SEARCH_ELEM_COUNT - 1;
-    
+static int binary_search(uint32_t target) {
+    int left = 0, right = SEARCH_ELEM_COUNT - 1;
     while (left <= right) {
         int mid = left + (right - left) / 2;
-        uint32_t val = sorted_data[mid]; 
-        
+        uint32_t val = sorted_data[mid];
         if (val == target) return mid;
         if (val < target) left = mid + 1;
         else right = mid - 1;
@@ -97,64 +80,30 @@ int binary_search(uint32_t target) {
     return -1;
 }
 
-void bm4_branch_heavy() {
-    uint32_t lcg_state = 987654321;
-    volatile int found_index;
-    
+static uint32_t bm4_branch_heavy(void) {
+    uint32_t lcg_state = 987654321u;
+    uint32_t acc = 0;
     for (int i = 0; i < 512; i++) {
-        lcg_state = (1103515245 * lcg_state + 12345) & 0x7FFFFFFF;
+        lcg_state = (1103515245u * lcg_state + 12345u) & 0x7FFFFFFF;
         uint32_t target = lcg_state % (SEARCH_ELEM_COUNT * 2);
-        found_index = binary_search(target);
+        acc += (uint32_t)binary_search(target);
     }
+    return acc;
 }
 
 // -----------------------------------------------------------------------------
-// Main Execution
+// The scored workload: init, run all four, fold into a checksum byte.
 // -----------------------------------------------------------------------------
-typedef struct {
-    uint32_t bm1_cycles;
-    uint32_t bm2_cycles;
-    uint32_t bm3_cycles;
-    uint32_t bm4_cycles;
-} BenchmarkResults;
+unsigned char run_workload(void) {
+    uint32_t chk = 0;
 
-volatile BenchmarkResults results;
+    for (int i = 0; i < SEARCH_ELEM_COUNT; i++)
+        sorted_data[i] = (uint32_t)i * 2;
 
-int main() {
-    uint32_t start, end;
+    chk ^= bm1_capacity_crusher(0xCAFEBABEu);
+    chk ^= bm2_linear_mult(0x12345678u);
+    chk ^= bm3_random_accessor();
+    chk ^= bm4_branch_heavy();
 
-    // Initialization for BM4 (Search)
-    for(int i=0; i<SEARCH_ELEM_COUNT; i++) {
-        sorted_data[i] = i * 2;
-    }
-
-    // --- Run Benchmark 1 ---
-    start = get_cycles();
-    bm1_capacity_crusher(0xCAFEBABE);
-    end = get_cycles();
-    results.bm1_cycles = end - start;
-
-    // --- Run Benchmark 2 ---
-    start = get_cycles();
-    bm2_linear_mult(0x12345678);
-    end = get_cycles();
-    results.bm2_cycles = end - start;
-
-    // --- Run Benchmark 3 ---
-    start = get_cycles();
-    bm3_random_accessor();
-    end = get_cycles();
-    results.bm3_cycles = end - start;
-
-    // --- Run Benchmark 4 ---
-    start = get_cycles();
-    bm4_branch_heavy();
-    end = get_cycles();
-    results.bm4_cycles = end - start;
-
-    while(1) {
-        asm volatile ("wfi");
-    }
-    
-    return 0;
+    return (unsigned char)chk;
 }

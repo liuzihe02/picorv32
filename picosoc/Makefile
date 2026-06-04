@@ -11,8 +11,8 @@ CFLAGS=
 # ---- Hacky fix: System clock (single source of truth: benchmarks.h F_CLK_HZ) ----
 # sed F_CLK_HZ/BAUD out of benchmarks.h and bridge them to the tools that can't read a C header:
 # the sim tb (-D) and nextpnr/icetime (MHz). Fail loudly if benchmarks.h is missing them
-F_CLK_HZ := $(shell sed -n 's/^#define F_CLK_HZ[[:space:]]*\([0-9]*\).*/\1/p' benchmarks.h)
-BAUD     := $(shell sed -n 's/^#define BAUD[[:space:]]*\([0-9]*\).*/\1/p' benchmarks.h)
+F_CLK_HZ := "17250000u"
+BAUD     := "115200u"
 ifeq ($(F_CLK_HZ),)
 $(error F_CLK_HZ not found in benchmarks.h -- expected a line like '#define F_CLK_HZ 17250000u')
 endif
@@ -106,8 +106,8 @@ icebreaker_sections.lds: sections.lds
 	$(CROSS)cpp -P -DICEBREAKER -o $@ $^
 
 #compile firmware with rv32im (not rv32ic) as required
-icebreaker_fw.elf: icebreaker_sections.lds start.s firmware.c benchmarks.c
-	$(CROSS)gcc $(CFLAGS) -DICEBREAKER -mabi=ilp32 -march=rv32im -Wl,-Bstatic,-T,icebreaker_sections.lds,--strip-debug -ffreestanding -nostdlib -o icebreaker_fw.elf start.s firmware.c benchmarks.c
+icebreaker_fw.elf: icebreaker_sections.lds start.s firmware.c benchmarks.c ../benchmarks/idea1.c
+	$(CROSS)gcc $(CFLAGS) -DICEBREAKER -mabi=ilp32 -march=rv32im -Wl,-Bstatic,-T,icebreaker_sections.lds,--strip-debug -ffreestanding -nostdlib -o icebreaker_fw.elf start.s firmware.c benchmarks.c ../benchmarks/idea1.c
 
 icebreaker_fw.hex: icebreaker_fw.elf
 	$(CROSS)objcopy -O verilog icebreaker_fw.elf icebreaker_fw.hex

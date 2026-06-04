@@ -104,9 +104,9 @@ unsigned char run_workload(void) {
         sorted_data[i] = (uint32_t)i * 2;
 
     bench_cold_fetch();
-    chk ^= bm2_linear_mult(0x12345678u);
-    chk ^= bm3_random_accessor();
-    chk ^= bm4_branch_heavy();
+    // chk ^= bm2_linear_mult(0x12345678u);
+    // chk ^= bm3_random_accessor();
+    // chk ^= bm4_branch_heavy();
 
     return (unsigned char)chk;
 }

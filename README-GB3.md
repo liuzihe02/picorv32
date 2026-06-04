@@ -944,7 +944,7 @@ wire pll_locked;
 SB_PLL40_PAD #(
     .FEEDBACK_PATH("SIMPLE"),
     .DIVR(4'b0000),       // = 0
-    .DIVF(7'b0110000),    // = 48
+    .DIVF(7'b0101101),    // = 45
     .DIVQ(3'b101),        // = 5
     .FILTER_RANGE(3'b001)
 ) pll (
@@ -959,7 +959,7 @@ SB_PLL40_PAD #(
 **The frequency** is set by three dividers (run `icepll -i 12 -o <ideal_freq>` to get valid values for a new target):
 
 $$
-f_{out} = f_{ref}\,\frac{DIVF+1}{(DIVR+1)\,2^{DIVQ}} = 12\,\frac{49}{32} = 18.375\text{ MHz}
+f_{out} = f_{ref}\,\frac{DIVF+1}{(DIVR+1)\,2^{DIVQ}} = 12\,\frac{46}{32} = 17.25\text{ MHz}
 $$
 
 Physical constraints bound our divider values: the **VCO** ($f_{ref}\frac{DIVF+1}{DIVR+1}$) must stay in **533–1066 MHz**, the phase-detector input ≥ 10 MHz, and the **PLL output floor is 16 MHz**. Lock takes ≤ 50 µs (the reason for the reset-until-`pll_locked` gate).
@@ -1002,7 +1002,7 @@ The payoff is large because the PLL speeds *everything* linearly in wall-clock (
 
 ##### Critical Path
 
-The actual critical path (`icebreaker.rpt`, post-route — **54.05 ns / 18.5 MHz, 15 logic levels, routing-dominated**: the LocalMux/Span4 hops ≈1.1 ns each dwarf the ~0.7 ns LUTs):
+The **baseline** critical path (knobs off; `icebreaker.rpt`, post-route — **~54 ns / 18.5 MHz, 15 logic levels, routing-dominated**: the LocalMux/Span4 hops ≈1.1 ns each dwarf the ~0.7 ns LUTs):
 
 ```text
 mem_addr[29]  (DFF, inside cpu)                                  1.5 ns  ┐ FRONT
@@ -1013,6 +1013,8 @@ mem_addr[29]  (DFF, inside cpu)                                  1.5 ns  ┐ FRO
        (mem_do_prefetch, instr_sb, instr_sll ×3 …)                      │ ~33 ns
   → reg_op1.CE  (+ the reg_op1 + decoded_imm adder)             54.0 ns  ┘
 ```
+
+> **Current default (knobs on, `LOOKAHEAD_DECODE=1`+`LOOKAHEAD_HIT=1`) — the path has *moved***. 1a-i deleted the front, so the binding path is no longer `…→reg_op1.CE`; measured (`icebreaker.rpt`, same icetime flow) it is now **51.10 ns / 19.57 MHz, 15 levels**, an in-core *fetch→decode→regfile-read* chain: `la_decode.dat_q (FF) → mem_rdata mux → cpu.decoded_rs1 (decode) → cpuregs read-addr → regfile RDATA setup`. The old `reg_op1.CE` load/store calc is now the *second* wall (baseline-off it measures ~53.8 ns). Either way the wall is **inside `picorv32`** and needs the same CPU surgery — the analysis below still holds; only the specific endpoint changed.
 
 Two semantically distinct halves, and the split is the whole story:
 
@@ -1037,26 +1039,25 @@ Re-read `Total path delay` after **every** step: the wall moves, and PnR placeme
 - **Register retiming** (`synth_ice40 -retime`) — let abc rebalance FFs across the cloud. Untried, free.
 - **Spend the PLL-to-closure margin** — we clock **17.25 MHz** against an ~18.5 MHz (icetime) / ~19.9 MHz (nextpnr) ceiling. If that gap is spendable, nudge `DIVF` toward ~18.4 (free ~7%) — but re-confirm it still P&Rs (we may sit at 17.25 *because* it closes reliably).
 
-**Step 1 — the structural clock win: get the address decode out of the `mem_ready` chain.** Two routes to the same goal — a shallow `mem_ready` = OR of flip-flops, with the peripheral address-compares (and the combinational GPIO decode that currently round-trips through `icebreaker.v`) off the path. **Step 1a is preferred**; 1b is the lighter fallback if 1a's wiring proves too invasive.
+**Step 1 — the structural clock win: get the address decode out of the `mem_ready` chain.** The goal — a shallow `mem_ready` = OR of flip-flops, with the peripheral address-compares (and the combinational GPIO decode that currently round-trips through `icebreaker.v`) off the path — via **look-ahead pre-decode** (Step 1a).
 
 **Build it behind a default-off knob** (same convention as `ENABLE_ICACHE`/`FLASH_INIT_MODE`): a param plumbed `icebreaker.v` → `picosoc.v` (e.g. `LOOKAHEAD_DECODE`) that defaults to today's combinational decode, so the verified baseline stays byte-identical and the new path is A/B-testable for fmax vs. CPI from one line in `icebreaker.v`.
 
-- **Step 1a — Look-ahead pre-decode (*preferred*).** Route picorv32's `mem_la_addr`/`mem_la_read` into `picosoc` (already driven by the core; `picosoc.v` just doesn't wire them) — a tiny **shared prerequisite**, then two *independent* pieces build on it. They touch different modules, target different metrics, and carry different risk, so do them **one at a time and verify after each** (don't bundle — a bundled gain/regression is un-attributable):
+- **Step 1a — Look-ahead pre-decode.** Route picorv32's `mem_la_addr`/`mem_la_read` into `picosoc` (already driven by the core; `picosoc.v` just doesn't wire them) — a tiny **shared prerequisite**, then two *independent* pieces build on it. They touch different modules, target different metrics, and carry different risk, so do them **one at a time and verify after each** (don't bundle — a bundled gain/regression is un-attributable):
 
   - **1a-i — decode fix (✅ done; the modest fmax win).** Off the look-ahead address, **register a one-hot region-select a cycle early**, so `mem_ready` becomes an FF-select with **no wait state** (the look-ahead address is valid the cycle before `mem_valid` → transactions stay 1-cycle, no double-write hazard). Shortens the critical-path front — *estimated* ~21 → ~5 ns; **measured ~20 → ~13 ns**, a real but small win because the back half dominates (full results + corrected conclusion below). Lives in `picosoc.v`; lower risk. *(The "no wait state" claim rests on the timing assumption below — verified in `lookahead_tb.v`.)*
   - **1a-ii — cache 1-cycle hit (a CPI bonus, do second, separate change).** The same `mem_la_*` wiring lets `icache` **pre-read its EBR off `mem_la_addr`** and answer a hot-loop hit in 1 cycle instead of 2 (~6.4 → ~5.x CPI), with `cpu_ready` still *registered* — **not** the rejected combinational hit. Lives in `icache.v`; riskier (it changes the hot-loop hit FSM — the path the I-cache *freeze* log was about). After landing it, **re-measure fmax** to prove the pre-read didn't claw the path back (it shouldn't — `cpu_ready` stays an FF — but verify).
+    - **✅ Done (measured) — Option A: narrow standalone `LOOKAHEAD_HIT` on the current 1 KB direct-mapped cache** (branch `crit`): a minimal serve/check/fill patch to today's `icache.v` behind a default-off `LOOKAHEAD_HIT` knob, *not* the full parametric rewrite — that ([Further Optimizations](#further-optimizations) `SETS/WAYS/WORDS_PER_LINE`) stays **deferred**. The knob name is shared on purpose: this narrow `LOOKAHEAD_HIT` *is* Stage 4 of that plan, so it carries over verbatim when/if the geometry rewrite happens. Plumbed `icebreaker.v` → `picosoc.v` → `icache` (`cpu_la_valid = mem_la_read && flash-region`, `cpu_la_addr = mem_la_addr[23:0]`). Single EBR read port kept (the look-ahead pre-read in `serve` and the fallback read in `check` never fire the same cycle); the hit compares `tag_q` against the **actual `cpu_addr` tag**, so a stale pre-read can only *miss*, never false-hit (the freeze-mode guard). **Verified + measured** (`crit`): `cache_la_tb.v` — boots trap-silent, **79,028 hits all ack in 1 cycle** (`lat 1..1`) vs **2** with the knob off, 663 cold misses, no false-hit. Knob-off rebuild byte-identical (`SIM PASS`). **EBR gotcha (real, caught in synth):** the naïve two-read-site FSM (pre-read off `cpu_la_addr` *and* fallback off `cpu_addr`) failed block-RAM inference → `data_mem` exploded to ~30k cells / 4 EBR; fixed with a **single muxed read port** (`rd_en`/`rd_idx`, one `tag_mem[rd_idx]`/`data_mem[rd_idx]` site) → back to 3 cache EBR / ~6.6k cells. **fmax-neutral:** mean **18.98 MHz** over 5 seeds vs 19.33 baseline (within placement noise — `cpu_ready` stays an FF, off the critical path). **CPI win** (the point, ~6.4 → ~5.x): the 2→1 hit saves one cycle per cache-served fetch; confirm the exact figure on-board (`run_benchmarks` off vs on — sim is too slow for a full `bench_*` pass). Files: `icache.v` (generate base/lahit), `picosoc.v` (knob + `cpu_la_*` wiring), `icebreaker.v` (param); test `cache_la_tb.v`. Independent of `LOOKAHEAD_DECODE` (different module/metric; only share the read-only `mem_la_*` bus).
 
   Cost: a few new ports through `picosoc` (prereq + 1a-i), plus `icache` for 1a-ii. This is what the look-ahead interface is *for*.
 
 > **Load-bearing assumption (verify, don't assume):** the "no wait state" claim requires `mem_la_read`/`mem_la_write` to lead `mem_valid` by *exactly one cycle for every transaction*, so the region-select registered off `mem_la_addr` matches the address `mem_valid` actually presents next cycle. This holds for `COMPRESSED_ISA=0` (no RVC prefetched-high-word replay), but **confirm it in sim** — a mismatch routes a transaction to the wrong responder. Also reproduce the existing decode's **region overlap/priority exactly**: `iomem_valid` (`addr[31:24] > 0x01`) covers *both* `0x02` (cfgreg/UART, exact-match selects) and `0x03` (GPIO), so the pre-decode must keep the same precedence (exact `0x0200_000x` selects beat the broad `> 0x01` iomem catch-all).
 
-- **Step 1b — Register the cold responders (*lighter fallback*).** Make cfgreg/UART return a *registered* `ready`/`rdata` (GPIO already does, via its `!iomem_ready` guard), dropping their compares off the chain. ~0 CPI — the kernels never touch those peripherals (`time_benchmark` brackets only `fn()`). **Caveat — it's reads, not writes:** the added wait state makes the registered `ready` land a cycle *after* select, so a *read* must **latch the responder's `rdata` at select-time** — `simpleuart` self-clears `recv_buf_valid` on `reg_dat_re`, so a late capture returns `~0` (empty) instead of the byte. (Writes are already safe: GPIO's `!iomem_ready` guard, the UART's `send_bitcnt` guard, idempotent cfgreg — there's no double-write.) Only the interactive menu hits these (the scored kernels touch no peripheral), but it must still work. This whole class of gotcha is *why 1a is preferred*: pre-registering only the select keeps peripherals 1-cycle, so nothing changes latency.
-
 ~~Estimate: front ~21 → ~5 ns ⇒ ~38 ns ≈ **~26 MHz**.~~ **Superseded by measurement — see below.**
 
 ###### ✅ Implemented + measured (1a-i)
 
-Built behind `LOOKAHEAD_DECODE` (default 0; plumbed `icebreaker.v` → `picosoc.v`): wire the core's `mem_la_addr`/`mem_la_read`/`mem_la_write` into `picosoc` and register the one-hot peripheral region-select a cycle early off `mem_la_addr`. Files touched: `picosoc.v` (ports + the generate-selected decode), `icebreaker.v` (param). **1a-ii (cache 1-cycle hit) is NOT done** — deferred pending the conclusion below. Knob-off stays byte-identical to baseline.
+Built behind `LOOKAHEAD_DECODE` (default 0; plumbed `icebreaker.v` → `picosoc.v`): wire the core's `mem_la_addr`/`mem_la_read`/`mem_la_write` into `picosoc` and register the one-hot peripheral region-select a cycle early off `mem_la_addr`. Files touched: `picosoc.v` (ports + the generate-selected decode), `icebreaker.v` (param). **1a-ii (cache 1-cycle hit) is now also done** — see the `LOOKAHEAD_HIT` bullet above (measured: every cache hit acks in 1 cycle, fmax-neutral). Both knobs default off; knob-off stays byte-identical to baseline.
 
 **Correctness** — `picosoc/lookahead_tb.v` runs the SoC with the knob on and asserts, on **every** `mem_valid` cycle, that the registered region-select equals the *true* combinational decode of the address actually presented (this is the direct test of the load-bearing 1-cycle-lead assumption + the region overlap/priority). Result: boots, no trap, **793,681 checks all matched**, with cfgreg (`S`) / UART-echo / GPIO exercised. Knob-off rebuild = baseline `SIM PASS`. Build it by swapping `lookahead_tb.v` for `icebreaker_tb.v` in the `iverilog` line; on-board, still confirm `bench_matmul`=204 etc.
 

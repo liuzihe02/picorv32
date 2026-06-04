@@ -79,6 +79,7 @@ module picosoc (
 	parameter [0:0] ENABLE_ICACHE = 1;   //default icache on
 	parameter [1:0] FLASH_INIT_MODE = 0; // spimemio reset read-mode: 0=single 1=dual 2=quad 3=qddr
 	parameter [0:0] LOOKAHEAD_DECODE = 0; // 0: combinational mem_ready decode (baseline); 1: register the peripheral region-select a cycle early off mem_la_addr (Step 1a-i: shortens the mem_ready critical-path front)
+	parameter [0:0] LOOKAHEAD_HIT = 0;    // 0: 2-cycle cache hit (baseline); 1: pre-read the icache EBR a cycle early off mem_la_addr (Step 1a-ii: 1-cycle hit, cpu_ready still registered)
 
 	parameter integer MEM_WORDS = 256;
 	parameter [31:0] STACKADDR = (4*MEM_WORDS);       // end of memory
@@ -205,13 +206,20 @@ module picosoc (
 	// Unlike a runtime `if`, this can add/remove module instances and continuous assigns.
 	generate if (ENABLE_ICACHE) begin : icache_gen
 		// Cached path: icache intercepts flash-region fetches, forwards misses to spimemio.
-		icache icache0 (
+		// Look-ahead pre-read (LOOKAHEAD_HIT, Step 1a-ii): the flash-region fetch one cycle
+		// early, so the cache can answer a hit in 1 cycle. Same region test as cpu_valid,
+		// but off the look-ahead address/strobe (mem_la_read leads mem_valid by a cycle).
+		icache #(
+			.LOOKAHEAD_HIT(LOOKAHEAD_HIT)
+		) icache0 (
 			.clk      (clk),
 			.resetn   (resetn),
 			.cpu_valid(mem_valid && mem_addr >= 4*MEM_WORDS && mem_addr < 32'h 0200_0000),
 			.cpu_addr (mem_addr[23:0]),
 			.cpu_ready(cache_ready),
 			.cpu_rdata(cache_rdata),
+			.cpu_la_valid(mem_la_read && mem_la_addr >= 4*MEM_WORDS && mem_la_addr < 32'h 0200_0000),
+			.cpu_la_addr (mem_la_addr[23:0]),
 			.spi_valid(spimem_valid),
 			.spi_addr (spimem_addr),
 			.spi_ready(spimem_ready),

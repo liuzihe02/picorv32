@@ -76,8 +76,9 @@ icebsim: icebreaker_tb.vvp icebreaker_fw.hex
 icebsynsim: icebreaker_syn_tb.vvp icebreaker_fw.hex
 	vvp -N $< +firmware=icebreaker_fw.hex
 
+#TODO: note that synthesizing with -noabc9 flag can give big clock boost
 icebreaker.json: icebreaker.v ice40up5k_spram.v spimemio.v simpleuart.v picosoc.v icache.v ../picorv32.v
-	yosys -ql icebreaker.log -p 'synth_ice40 -dsp -top icebreaker -json icebreaker.json' $^
+	yosys -ql icebreaker.log -p 'synth_ice40 -dsp -noabc9 -top icebreaker -json icebreaker.json' $^
 
 icebreaker_tb.vvp: icebreaker_tb.v icebreaker.v ice40up5k_spram.v spimemio.v simpleuart.v picosoc.v icache.v ../picorv32.v spiflash.v
 	iverilog -DNO_ICE40_DEFAULT_ASSIGNMENTS -DSIM $(CLK_DEFS) -s testbench -o $@ $^ `yosys-config --datdir/ice40/cells_sim.v`

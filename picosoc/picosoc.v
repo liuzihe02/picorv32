@@ -75,6 +75,7 @@ module picosoc (
 	parameter [0:0] ENABLE_FAST_MUL = 0;
 	parameter [0:0] ENABLE_COMPRESSED = 1;
 	parameter [0:0] ENABLE_COUNTERS = 1;
+	parameter [0:0] ENABLE_IRQ = 0;      // 0: no IRQ FSM (default). picosoc ties irq_5/6/7 to 0 and rv32im can't emit the custom IRQ ops, so it's dead weight -- off thins cpu_state / saves LCs. Editable from icebreaker.
 	parameter [0:0] ENABLE_IRQ_QREGS = 0;
 	parameter [0:0] ENABLE_ICACHE = 1;   //default icache on
 	parameter [1:0] FLASH_INIT_MODE = 0; // spimemio reset read-mode: 0=single 1=dual 2=quad 3=qddr
@@ -154,7 +155,7 @@ module picosoc (
 		.ENABLE_MUL(ENABLE_MUL),
 		.ENABLE_DIV(ENABLE_DIV),
 		.ENABLE_FAST_MUL(ENABLE_FAST_MUL),
-		.ENABLE_IRQ(0),
+		.ENABLE_IRQ(ENABLE_IRQ),
 		.ENABLE_IRQ_QREGS(ENABLE_IRQ_QREGS)
 	) cpu (
 		.clk         (clk        ),

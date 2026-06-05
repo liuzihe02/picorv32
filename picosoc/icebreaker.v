@@ -159,6 +159,7 @@ module icebreaker (
 		.ENABLE_COMPRESSED(0), // off: rv32im has no C extension
 		.ENABLE_ICACHE(1),     // 1: instruction cache on; 0: direct flash fetch (baseline)
 		.FLASH_INIT_MODE(3),   // 0=single(0x03) 1=dual(0xBB) 2=quad(0xEB) 3=qddr(0xED)
+		.LOOKAHEAD_HIT(1),     // 1: 1-cycle icache hit via look-ahead pre-read; 0: 2-cycle baseline
 		.MEM_WORDS(MEM_WORDS)
 	) soc (
 		.clk          (clk         ),

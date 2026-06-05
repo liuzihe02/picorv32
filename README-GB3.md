@@ -996,6 +996,7 @@ Built behind `LOOKAHEAD_DECODE` (default 0; plumbed `icebreaker.v` → `picosoc.
 **Rejected (with the report as the evidence):**
 
 - **Register `mem_ready` wholesale** — cuts the chain but taxes *every* fetch/load/store with a wait state (~1.2× CPI) and undoes the cache win. Step 1 gets most of the gain without the tax, because peripherals are free to slow down but memory is not.
+> We tried this. It does boost max freq to like 24MHz, but also increases CPI by about 1/2 more cycles
 - **Combinational cache hit** (drive `cpu_ready` combinationally on a hit) — feeds `cache_ready` straight *into the `mem_ready` front-half mux that is the bottleneck*; it lengthens the binding path. Use the look-ahead 1-cycle hit (1a) instead.
 - **`TWO_CYCLE_ALU`/`TWO_CYCLE_COMPARE`** — the ALU is nowhere on the path; pure CPI loss.
 

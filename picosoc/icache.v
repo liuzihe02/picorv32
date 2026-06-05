@@ -13,7 +13,11 @@
 // On a fill we replace only the victim way's slice, copying the other ways from
 // the just-read line -- so yosys never sees a dynamic partial-memory write.
 //
-// Same port list as the original icache, so picosoc.v needs no changes.
+// 1-cycle hit via look-ahead pre-read: when cpu_la_valid pulses (mem_la_read, gated to the
+// flash region in picosoc), the EBR read is issued a cycle EARLY off cpu_la_addr, so when
+// cpu_valid arrives the set is already staged and we compare-and-ack in one cycle. Tie
+// cpu_la_valid=0 (picosoc LOOKAHEAD_HIT=0) and the fast path constant-folds away, leaving the
+// 2-cycle fallback == the pre-look-ahead baseline. cpu_ready stays registered either way.
 
 
 //TODO: change cache params here
@@ -30,6 +34,11 @@ module icache #(
 	input  [23:0] cpu_addr,
 	output reg    cpu_ready,
 	output reg [31:0] cpu_rdata,
+
+	// Look-ahead side: the flash-region fetch one cycle early (mem_la_read/mem_la_addr,
+	// region-gated in picosoc). cpu_la_valid=0 disables (always 2-cycle fallback).
+	input         cpu_la_valid,
+	input  [23:0] cpu_la_addr,
 
 	// SPI side: forwarded to spimemio on a miss
 	output reg        spi_valid,
@@ -70,6 +79,15 @@ module icache #(
 	reg            init_done;
 	reg [IDX_BITS-1:0] init_idx;
 
+	// Look-ahead pre-read state. pre_valid: a look-ahead read is staged in tag_q/data_q for
+	// set req_idx. rd_en/rd_idx: scratch -- this cycle's SINGLE muxed EBR read (one read site
+	// keeps tag_mem/data_mem 1R1W -> SB_RAM40). cpu_*/la_idx: combinational address slices.
+	reg            pre_valid;
+	reg            rd_en;
+	reg [IDX_BITS-1:0] rd_idx, la_idx, cpu_idx;
+	reg [TAG_BITS-1:0] cpu_tag;
+	reg [FCW-1:0]      cpu_off;
+
 	// Byte address of word 0 of the requested line: {tag, index, 0...0}. Word k is
 	// line_base + (k<<2). Built by replication (not a fill_cnt concat) so it is also
 	// correct when OFF_BITS==0 (WORDS_PER_LINE==1) -- a raw {..,fill_cnt,2'b00} concat
@@ -93,18 +111,63 @@ module icache #(
 			tag_mem[init_idx] <= 0;                 // clear all way valid-bits in this set
 			init_idx <= init_idx + 1;
 			if (init_idx == SETS-1) init_done <= 1;
+			pre_valid <= 0;
 		end
 
 		else
 		case (state)
-			s_idle: begin
+			s_idle: begin   // "serve": a look-ahead pre-read may already be staged in tag_q/data_q
+				// combinational decode of this cycle's addresses (blocking; used below)
+				cpu_idx = cpu_addr[2+OFF_BITS +: IDX_BITS];
+				cpu_tag = cpu_addr[2+OFF_BITS+IDX_BITS +: TAG_BITS];
+				cpu_off = (OFF_BITS > 0) ? cpu_addr[2 +: FCW] : {FCW{1'b0}};
+				la_idx  = cpu_la_addr[2+OFF_BITS +: IDX_BITS];
+				rd_en   = 1'b0;
+				rd_idx  = la_idx;
+
 				if (cpu_valid && !cpu_ready) begin
-					req_idx <= cpu_addr[2+OFF_BITS +: IDX_BITS];
-					req_tag <= cpu_addr[2+OFF_BITS+IDX_BITS +: TAG_BITS];
-					req_off <= (OFF_BITS > 0) ? cpu_addr[2 +: FCW] : {FCW{1'b0}};
-					tag_q   <= tag_mem [cpu_addr[2+OFF_BITS +: IDX_BITS]];
-					data_q  <= data_mem[cpu_addr[2+OFF_BITS +: IDX_BITS]];
-					state   <= s_check;
+					if (pre_valid && req_idx == cpu_idx) begin
+						// staged read is the RIGHT SET -> compare its ways against the CPU's
+						// ACTUAL tag (not req_tag) and decide now, no EBR read. A stale/wrong
+						// pre-read can only miss here, never false-hit.
+						hit = 1'b0;
+						hit_way = {VW{1'b0}};
+						for (w = 0; w < WAYS; w = w + 1)
+							if (tag_q[w*TAGW +: TAGW] == {1'b1, cpu_tag}) begin
+								hit = 1'b1;
+								hit_way = w[VW-1:0];
+							end
+						if (hit) begin
+							sel_line  = data_q[hit_way*LINE +: LINE];
+							cpu_rdata <= sel_line[cpu_off*32 +: 32];
+							cpu_ready <= 1;                            // 1-cycle hit
+						end else begin
+							req_idx <= cpu_idx; req_tag <= cpu_tag; req_off <= cpu_off;
+							fill_cnt <= {FCW{1'b0}};
+							state    <= s_fill;                        // fast miss (spi driven in s_fill)
+						end
+						pre_valid <= 0;
+					end else begin
+						// no usable pre-read -> 2-cycle fallback: read cpu's set now, compare in s_check
+						rd_en   = 1'b1;
+						rd_idx  = cpu_idx;
+						req_idx <= cpu_idx;
+						req_tag <= cpu_tag;
+						req_off <= cpu_off;
+						state   <= s_check;
+						pre_valid <= 0;
+					end
+				end else if (cpu_la_valid) begin
+					// stage the look-ahead pre-read (one cycle early)
+					rd_en   = 1'b1;
+					rd_idx  = la_idx;
+					req_idx <= la_idx;
+					pre_valid <= 1;
+				end
+
+				if (rd_en) begin   // the SINGLE EBR read site
+					tag_q  <= tag_mem [rd_idx];
+					data_q <= data_mem[rd_idx];
 				end
 			end
 
@@ -185,6 +248,7 @@ module icache #(
 			victim_ctr <= {VW{1'b0}};
 			init_done  <= 0;
 			init_idx   <= 0;
+			pre_valid  <= 0;
 		end
 	end
 endmodule

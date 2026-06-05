@@ -33,6 +33,8 @@ module icache_check #(
 	reg         resetn = 0;
 	reg         cpu_valid = 0;
 	reg  [23:0] cpu_addr  = 0;
+	reg         cpu_la_valid = 0;   // look-ahead pre-read strobe (LOOKAHEAD_HIT fast path)
+	reg  [23:0] cpu_la_addr  = 0;
 	wire        cpu_ready;
 	wire [31:0] cpu_rdata;
 
@@ -99,6 +101,7 @@ module icache_check #(
 		.clk(clk), .resetn(resetn),
 		.cpu_valid(cpu_valid), .cpu_addr(cpu_addr),
 		.cpu_ready(cpu_ready), .cpu_rdata(cpu_rdata),
+		.cpu_la_valid(cpu_la_valid), .cpu_la_addr(cpu_la_addr),
 		.spi_valid(spi_valid), .spi_addr(spi_addr),
 		.spi_ready(spi_ready), .spi_rdata(spi_rdata)
 	);
@@ -161,7 +164,40 @@ module icache_check #(
 		end
 	endtask
 
+	// ---- look-ahead read: stage cpu_la one cycle, then present the matching request ------
+	// Drives the LOOKAHEAD_HIT fast path. Returns latency (cpu_valid->cpu_ready) and whether a
+	// flash fetch happened (miss); checks data == golden. A staged hit must ack in 1 cycle.
+	task do_read_la(input [23:0] a, output integer o_lat, output reg o_missed);
+		integer g; reg sawspi;
+		begin
+			cpu_la_addr = a; cpu_la_valid = 1; cpu_valid = 0;
+			@(posedge clk);                       // stage the pre-read
+			cpu_la_valid = 0;
+			cpu_addr = a; cpu_valid = 1;          // present the request
+			o_lat = 0; sawspi = 0; g = 0;
+			@(posedge clk); #1;                  // sample after NBAs commit (avoid active-region race)
+			while (!cpu_ready && g < 100000) begin
+				o_lat = o_lat + 1;
+				if (spi_valid) sawspi = 1;
+				@(posedge clk); #1;
+				g = g + 1;
+			end
+			o_lat = o_lat + 1;                   // count the cycle cpu_ready asserted
+			if (g >= 100000) begin errs = errs + 1; $display("  FAIL la hang addr=%06h", a); end
+			reads = reads + 1;
+			if (cpu_rdata !== golden(a)) begin
+				errs = errs + 1;
+				$display("  FAIL la data addr=%06h got=%08h exp=%08h", a, cpu_rdata, golden(a));
+			end
+			o_missed = sawspi;
+			cpu_valid = 0;
+			@(posedge clk);
+		end
+	endtask
+
 	integer i, it, li, off, f0, nhot, idx;
+	integer la_lat;
+	reg     la_miss;
 	reg [23:0] hot [0:63];   // hot-loop working-set addresses
 	reg [23:0] a;
 	reg [31:0] rng;
@@ -265,6 +301,54 @@ module icache_check #(
 			rng = rng ^ (rng << 13); rng = rng ^ (rng >> 17); rng = rng ^ (rng << 5);
 			a = rng & (WAY_STRIDE*16 - 1) & 24'hFFFFFC;  // word-aligned, bounded -> forces reuse
 			do_read(a, 2);
+		end
+
+		// 8) LOOKAHEAD fast-path (drive cpu_la one cycle before cpu_valid). Tags >=16 sit
+		//    outside the random-stress range (a < WAY_STRIDE*16) and all earlier tests, so
+		//    first-touch is a deterministic miss. (Tests 1-7 above run with cpu_la_valid=0,
+		//    i.e. they cover the 2-cycle FALLBACK path == the pre-look-ahead baseline.)
+		do_read_la(waddr(16, 2, 0), la_lat, la_miss);    // (a) first touch -> staged MISS + fill
+		if (!la_miss)
+			begin errs = errs + 1; $display("  FAIL la(a) first-touch should miss"); end
+		do_read_la(waddr(16, 2, 0), la_lat, la_miss);    // (b) re-read -> 1-cycle HIT, no flash
+		if (la_miss || la_lat != 1)
+			begin errs = errs + 1; $display("  FAIL la(b) hit lat=%0d miss=%b (want 1,0)", la_lat, la_miss); end
+
+		// (c) no-false-hit: cache X(tag17,idx4); stage la=X; request Y(tag18, SAME index, diff
+		//     tag). Must serve golden(Y), never golden(X) -- the compare uses cpu_tag, not req_tag.
+		do_read(waddr(17, 4, 0), 2);                     // cache X
+		cpu_la_addr = waddr(17, 4, 0); cpu_la_valid = 1; cpu_valid = 0; @(posedge clk);  // stage X
+		cpu_la_valid = 0; cpu_addr = waddr(18, 4, 0); cpu_valid = 1;                      // request Y
+		la_lat = 0;
+		@(posedge clk); #1;
+		while (!cpu_ready && la_lat < 100000) begin @(posedge clk); #1; la_lat = la_lat + 1; end
+		reads = reads + 1;
+		if (cpu_rdata !== golden(waddr(18, 4, 0)))
+			begin errs = errs + 1; $display("  FAIL la(c) no-false-hit got=%08h exp=%08h",
+				cpu_rdata, golden(waddr(18, 4, 0))); end
+		cpu_valid = 0; @(posedge clk);
+
+		// (d) multi-word: warm a line, stage la for word 0, request word 1 of the SAME line ->
+		//     1-cycle hit serving the correct (cpu-offset) word.
+		if (WORDS > 1) begin
+			do_read(waddr(19, 6, 0), 2);                 // warm the whole line
+			cpu_la_addr = waddr(19, 6, 0); cpu_la_valid = 1; cpu_valid = 0; @(posedge clk);  // stage word0
+			cpu_la_valid = 0; cpu_addr = waddr(19, 6, 1); cpu_valid = 1;                      // request word1
+			la_lat = 0; la_miss = 0;
+			@(posedge clk); #1;
+			while (!cpu_ready && la_lat < 100000) begin
+				la_lat = la_lat + 1;
+				if (spi_valid) la_miss = 1;
+				@(posedge clk); #1;
+			end
+			la_lat = la_lat + 1;
+			reads = reads + 1;
+			if (cpu_rdata !== golden(waddr(19, 6, 1)))
+				begin errs = errs + 1; $display("  FAIL la(d) multiword got=%08h exp=%08h",
+					cpu_rdata, golden(waddr(19, 6, 1))); end
+			if (la_miss || la_lat != 1)
+				begin errs = errs + 1; $display("  FAIL la(d) not 1-cyc hit lat=%0d miss=%b", la_lat, la_miss); end
+			cpu_valid = 0; @(posedge clk);
 		end
 
 		$display("icache_check: SETS=%0d WAYS=%0d WORDS=%0d LAT=%0d SLAT=%0d -> %0d reads, %0d errors %s",

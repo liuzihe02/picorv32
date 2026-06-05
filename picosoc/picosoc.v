@@ -78,6 +78,7 @@ module picosoc (
 	parameter [0:0] ENABLE_IRQ_QREGS = 0;
 	parameter [0:0] ENABLE_ICACHE = 1;   //default icache on
 	parameter [1:0] FLASH_INIT_MODE = 0; // spimemio reset read-mode: 0=single 1=dual 2=quad 3=qddr
+	parameter [0:0] LOOKAHEAD_HIT = 0;   // 0: 2-cycle icache hit (baseline); 1: pre-read the icache EBR a cycle early off mem_la_addr -> 1-cycle hit (cpu_ready still registered)
 
 	parameter integer MEM_WORDS = 256;
 	parameter [31:0] STACKADDR = (4*MEM_WORDS);       // end of memory
@@ -104,6 +105,10 @@ module picosoc (
 	wire [31:0] mem_wdata;
 	wire [3:0] mem_wstrb;
 	wire [31:0] mem_rdata;
+
+	// look-ahead bus (driven by picorv32, valid one cycle before mem_valid) -- LOOKAHEAD_HIT
+	wire        mem_la_read;
+	wire [31:0] mem_la_addr;
 
 	wire        spimem_valid;
 	wire [23:0] spimem_addr;
@@ -161,6 +166,8 @@ module picosoc (
 		.mem_wdata   (mem_wdata  ),
 		.mem_wstrb   (mem_wstrb  ),
 		.mem_rdata   (mem_rdata  ),
+		.mem_la_read (mem_la_read),
+		.mem_la_addr (mem_la_addr),
 		.irq         (irq        )
 	);
 
@@ -175,6 +182,10 @@ module picosoc (
 			.cpu_addr (mem_addr[23:0]),
 			.cpu_ready(cache_ready),
 			.cpu_rdata(cache_rdata),
+			// LOOKAHEAD_HIT: pre-read off the look-ahead address (flash region only). Constant 0
+			// when the knob is off -> the cache's fast-path logic constant-folds away (baseline).
+			.cpu_la_valid(LOOKAHEAD_HIT && mem_la_read && mem_la_addr >= 4*MEM_WORDS && mem_la_addr < 32'h 0200_0000),
+			.cpu_la_addr (mem_la_addr[23:0]),
 			.spi_valid(spimem_valid),
 			.spi_addr (spimem_addr),
 			.spi_ready(spimem_ready),

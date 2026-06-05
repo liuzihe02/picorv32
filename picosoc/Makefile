@@ -11,8 +11,8 @@ CFLAGS=
 # ---- Hacky fix: System clock (single source of truth: benchmarks.h F_CLK_HZ) ----
 # sed F_CLK_HZ/BAUD out of benchmarks.h and bridge them to the tools that can't read a C header:
 # the sim tb (-D) and nextpnr/icetime (MHz). Fail loudly if benchmarks.h is missing them
-F_CLK_HZ := 17250000
-BAUD     := 115200
+F_CLK_HZ := $(shell sed -n 's/^#define F_CLK_HZ[[:space:]]*\([0-9]*\).*/\1/p' benchmarks.h)
+BAUD     := $(shell sed -n 's/^#define BAUD[[:space:]]*\([0-9]*\).*/\1/p' benchmarks.h)
 ifeq ($(F_CLK_HZ),)
 $(error F_CLK_HZ not found in benchmarks.h -- expected a line like '#define F_CLK_HZ 17250000u')
 endif

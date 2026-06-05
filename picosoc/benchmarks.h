@@ -19,7 +19,7 @@
 // ---- System configuration ----
 // TODO: Update F_CLK_HZ whenever you change the PLL (see icebreaker.v SB_PLL40_PAD)
 // these global variables will be used everywhere
-#define F_CLK_HZ 17250000u   // PLL system clock, Hz
+#define F_CLK_HZ 22500000u   // PLL system clock, Hz (DIVF=59 in icebreaker.v: 12*60/32 = 22.5 MHz)
 #define BAUD     115200u     // UART console baud
 
 typedef uint8_t (*bench_fn)(void);

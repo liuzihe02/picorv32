@@ -1,3 +1,18 @@
+# GB3 RISC-V Processor Project
+
+This repo houses the HDL code for optimizing the base picorv32 CPU. Our main features include:
+
+- Instruction cache from fetching from `spimemio`
+  - Cache lookahead for 2-cycle cache hit instead of 1 cycle
+  - Generalized cache module supporting direct mapped cache, set associative and fully associative cache
+- Higher system clock through the `PLL` module and synthesizing with `noabc9`
+- Default QDDR and QSPI modes at chip boot
+
+We used the `iCE40UP5K`, compiled with `oss-cad-suite` and `rv32im` ISA. Competition details are available [here](https://teaching.eng.cam.ac.uk/content/engineering-tripos-part-iia-project-gb3-risc-v-processor-2025-26).
+
+Refer to the [README-GB3](/README-GB3.md) file for our implementation plan, and the technical guide [pdf](/guide/guide.pdf) for deep-dive on microarchitecture and technical background.
+
+---
 [![.github/workflows/ci.yml](https://github.com/YosysHQ/picorv32/actions/workflows/ci.yml/badge.svg)](https://github.com/YosysHQ/picorv32/actions/workflows/ci.yml)
 
 PicoRV32 - A Size-Optimized RISC-V CPU

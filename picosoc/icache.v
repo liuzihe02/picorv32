@@ -22,8 +22,8 @@
 
 //TODO: change cache params here
 module icache #(
-	parameter integer SETS           = 2048,  // number of indices (power of 2)
-	parameter integer WAYS           = 1,    // associativity (1 = direct-mapped)
+	parameter integer SETS           = 1024,  // number of indices (power of 2)
+	parameter integer WAYS           = 2,    // associativity (1 = direct-mapped)
 	parameter integer WORDS_PER_LINE = 1     // words per line/block (power of 2)
 ) (
 	input         clk,

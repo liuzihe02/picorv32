@@ -15,10 +15,12 @@
 //
 // Same port list as the original icache, so picosoc.v needs no changes.
 
+
+//TODO: change cache params here
 module icache #(
-	parameter integer SETS           = 256,  // number of indices (power of 2)
+	parameter integer SETS           = 2048,  // number of indices (power of 2)
 	parameter integer WAYS           = 1,    // associativity (1 = direct-mapped)
-	parameter integer WORDS_PER_LINE = 4     // words per line/block (power of 2)
+	parameter integer WORDS_PER_LINE = 1     // words per line/block (power of 2)
 ) (
 	input         clk,
 	input         resetn,
@@ -67,6 +69,12 @@ module icache #(
 
 	reg            init_done;
 	reg [IDX_BITS-1:0] init_idx;
+
+	// Byte address of word 0 of the requested line: {tag, index, 0...0}. Word k is
+	// line_base + (k<<2). Built by replication (not a fill_cnt concat) so it is also
+	// correct when OFF_BITS==0 (WORDS_PER_LINE==1) -- a raw {..,fill_cnt,2'b00} concat
+	// would inject a spurious low bit there and corrupt the index.
+	wire [23:0] line_base = {req_tag, req_idx, {(OFF_BITS+2){1'b0}}};
 
 	// loop / combinational temporaries
 	integer         w, k;
@@ -122,9 +130,16 @@ module icache #(
 			end
 
 			s_fill: begin
-				// fetch the line word-by-word; sequential addrs ride spimemio's stream
+				// Fetch the line word-by-word; sequential addrs ride spimemio's stream.
+				// spimemio holds `ready` HIGH (level) while the requested word is available
+				// and presents rdata for the address it currently acks (spi_addr == rd_addr).
+				// Capture on the level, but advance spi_addr in LOCKSTEP on the capture cycle
+				// (the assignment below the if() overrides this default) so we never re-grab the
+				// same word into the next slot. Edge-detecting ready instead is racy: when
+				// spimemio advances rd_addr the same cycle the cache advances spi_addr, ready
+				// never falls and the rising edge -- hence the word -- is missed.
 				spi_valid <= 1;
-				spi_addr  <= {req_tag, req_idx, fill_cnt, 2'b00};
+				spi_addr  <= line_base + (fill_cnt << 2);
 				if (spi_ready) begin
 					for (k = 0; k < WORDS_PER_LINE; k = k + 1)
 						if (k[FCW-1:0] == fill_cnt)
@@ -156,6 +171,7 @@ module icache #(
 						state       <= s_idle;
 					end else begin
 						fill_cnt <= fill_cnt + 1'b1;
+						spi_addr <= line_base + ((fill_cnt + 1'b1) << 2);  // advance in lockstep
 					end
 				end
 			end

@@ -115,6 +115,14 @@ icebreaker_fw.hex: icebreaker_fw.elf
 icebreaker_fw.bin: icebreaker_fw.elf
 	$(CROSS)objcopy -O binary icebreaker_fw.elf icebreaker_fw.bin
 
+# ---- Instruction-cache unit test ----
+
+icache_tb: icache_tb.vvp
+	vvp -N icache_tb.vvp
+
+icache_tb.vvp: icache_tb.v icache.v
+	iverilog -g2012 -s icache_tb -o $@ $^
+
 # ---- Testbench for SPI Flash Model ----
 
 spiflash_tb: spiflash_tb.vvp icebreaker_fw.hex
@@ -138,7 +146,8 @@ clean:
 	rm -f hx8kdemo_syn.v hx8kdemo_syn_tb.vvp hx8kdemo_tb.vvp
 	rm -f icebreaker.json icebreaker.log icebreaker.asc icebreaker.rpt icebreaker.bin
 	rm -f icebreaker_syn.v icebreaker_syn_tb.vvp icebreaker_tb.vvp
+	rm -f icache_tb.vvp icache_tb.vcd
 
-.PHONY: spiflash_tb clean
+.PHONY: spiflash_tb clean icache_tb
 .PHONY: hx8kprog hx8kprog_fw hx8ksim hx8ksynsim
 .PHONY: icebprog icebprog_fw icebsim icebsynsim

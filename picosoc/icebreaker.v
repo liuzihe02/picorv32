@@ -61,7 +61,7 @@ module icebreaker (
 	SB_PLL40_PAD #(
 		.FEEDBACK_PATH("SIMPLE"),
 		.DIVR(4'b0000),
-		.DIVF(7'b0111011),
+		.DIVF(7'b0111100),    // = 60 -> 12*(60+1)/(1*2^5) = 22.875 MHz (icepll -i 12 -o 22.9)
 		.DIVQ(3'b101),
 		.FILTER_RANGE(3'b001)
 	) pll (

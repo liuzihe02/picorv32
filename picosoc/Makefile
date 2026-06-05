@@ -89,8 +89,9 @@ icebreaker_syn_tb.vvp: icebreaker_tb.v icebreaker_syn.v spiflash.v
 icebreaker_syn.v: icebreaker.json
 	yosys -p 'read_json icebreaker.json; write_verilog icebreaker_syn.v'
 
+#sweep the seed nextpnr-ice40 --seed N for icetime, could give better clock ceilings for rpt
 icebreaker.asc: icebreaker.pcf icebreaker.json
-	nextpnr-ice40 --freq $(CLK_MHZ) --up5k --package sg48 --asc icebreaker.asc --pcf icebreaker.pcf --json icebreaker.json
+	nextpnr-ice40 --seed 6 --freq $(CLK_MHZ) --up5k --package sg48 --asc icebreaker.asc --pcf icebreaker.pcf --json icebreaker.json
 
 icebreaker.bin: icebreaker.asc
 	icetime -d up5k -c $(CLK_MHZ) -mtr icebreaker.rpt icebreaker.asc

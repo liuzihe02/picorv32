@@ -4,7 +4,7 @@
 # for mac, set environment variable `export RISCV_GNU_TOOLCHAIN_INSTALL_PREFIX=/opt/homebrew/opt/riscv-gnu-toolchain/main` and then use `$(RISCV_GNU_TOOLCHAIN_INSTALL_PREFIX)/bin/riscv32-unknown-elf-` in the Makefile as shown below
 # for zach's wsl just run the makefile with 
 # make icebprog CROSS=/opt/riscv32imc/bin/riscv32-unknown-elf-
-CROSS=$(RISCV_GNU_TOOLCHAIN_INSTALL_PREFIX)/bin/riscv64-unknown-elf-
+CROSS=$(RISCV_GNU_TOOLCHAIN_INSTALL_PREFIX)/bin/riscv32-unknown-elf-
 
 CFLAGS=
 

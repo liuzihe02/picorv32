@@ -22,7 +22,7 @@ Tier 1 Files
 | `picosoc/spimemio.v` | SPI flash controller — the dominant fetch-latency block: fast-read reset defaults, jump penalty, line-buffer insertion point. |
 | `picosoc/icebreaker.v` | Top-level for the iCEBreaker board: instantiates `picosoc` (iCE40UP5K config, SPRAM, 7-seg; no PLL, raw 12 MHz). Current rv32im params: `BARREL_SHIFTER=0`, `ENABLE_MUL=0`, `ENABLE_DIV=1`, `ENABLE_FAST_MUL=1`, `ENABLE_COMPRESSED=0`, `ENABLE_ICACHE` (cache on/off). |
 | `picosoc/picosoc.v` | SoC wrapper. Wires CPU to SRAM, UART, SPI flash, GPIO. Address decode + memory map live here; the `icache` sits on this bus between the CPU and `spimemio`. |
-| `picosoc/icache.v` | Instruction cache (added): direct-mapped, 256-entry, 1-word/line, EBR-backed. Intercepts the flash-region fetch path. |
+| `picosoc/icache.v` | Instruction cache (added): parametric `SETS`×`WAYS`×`WORDS_PER_LINE` (direct-mapped or set-associative, multi-word lines), EBR-backed. Currently built 2-way × 4-word × 256-set. Intercepts the flash-region fetch path. |
 | `README.md` | Full documentation of all configuration parameters. |
 | `picosoc/README.md` | picosoc documentation. |
 | `picosoc/benchmarks.c` | benchmark suite |
@@ -45,6 +45,7 @@ Tier 3 Files
 | File | Role |
 | --- | --- |
 | `picosoc/icebreaker_tb.v` | Testbench for simulation (cycle counts). |
+| `picosoc/icache_tb.v` | Standalone `icache` unit test vs a streaming golden-flash model; sweeps several geometries/latencies in one run (`make icache_tb`). Asserts data correctness + hit/miss behaviour + invalidation. |
 | `picosoc/spiflash.v` | Behavioural SPI flash model (W25Q-like): QSPI/CRM/DDR timing; used by `icebreaker_tb.v`. Needed to measure cache/fetch-latency changes in sim. |
 | `picosoc/Makefile` | Build flow: yosys → nextpnr → icepack → iceprog (area + fmax). Firmware compiled `-march=rv32im -mabi=ilp32`. |
 | `tests/*.S` | 45 RISC-V instruction unit tests (must still pass after edits). |
@@ -623,25 +624,22 @@ mem_rdata = priority-mux in the same order
 
 #### Structure
 
-Direct-mapped, 256 lines × 1 word = **1 KB**, read-only (no write policy). Our cache comprises of two arrays, both inferred synsthesized to EBR:
+Parametric and read-only (no write policy): `SETS × WAYS × WORDS_PER_LINE` words, set by the params at the top of `icache.v` (`WAYS=1` ⇒ direct-mapped, `WAYS>1` ⇒ set-associative with round-robin replacement). **Currently built 2-way × 4-word × 256-set = 8 KB.** Two EBR-inferred arrays, written *full-width per set* (the whole line, all ways) so yosys never sees a dynamic partial-memory write:
 
 ```verilog
-reg [31:0] data_mem [0:255];   // 256x32 -> 2 EBR (16-bit-wide blocks paired)
-reg [14:0] tag_mem  [0:255];   // 256x15  (bit14 = valid, [13:0] = tag) -> 1 EBR
+reg [DATAW-1:0] data_mem [0:SETS-1];   // per set: all ways' lines   (DATAW = WAYS*WORDS_PER_LINE*32)
+reg [TAGMW-1:0] tag_mem  [0:SETS-1];   // per set: all ways' {valid, tag}  (TAGW = 1 + tag bits)
 ```
 
-**3 EBR** of 26 utilized. The 24-bit flash address `cpu_addr = mem_addr[23:0]` splits as:
+The 24-bit flash address `cpu_addr = mem_addr[23:0]` splits parametrically — with `i = log2(SETS)`, `w = log2(WORDS_PER_LINE)`:
 
 ```text
-┌──────────────────────────────────────────────────────────┬──────────────────────────────┬──────┐
-│                       tag (14)                           │          index (8)           │  00  │
-└──────────────────────────────────────────────────────────┴──────────────────────────────┴──────┘
-23                                                       10|9                            2|1    0
-
-              which line holds it?                     which of 256 sets          word-aligned
+ tag [23 : 2+i+w] | index [1+i+w : 2+w] | word [1+w : 2] | byte [1:0]
 ```
 
-For a hit, both `index` and `tag` bits must align. First, we index into the cache with `tag_mem[cpu_addr[9:2]]`. If the full tag and index matches `tag_mem[cpu_addr[9:2]]==cpu_addr[23:10]`, and the bit is valid, then we have a hit. Otherwise cache miss need to fetch from `spimemio` next cycle.
+For the current 2-way × 4-word × 256-set build (`i=8, w=2`): `tag [23:12] (12b) | index [11:4] (256 sets) | word [3:2] (4/line) | byte [1:0]`.
+
+For a hit, the `index` selects the set; the `WAYS` stored tags are read and compared **in parallel** against the address `tag`, and a way hits if its valid bit is set and its tag matches. The `word` offset then selects which word of the hit line to return. On a miss the victim way's line is (re)filled from `spimemio` — multi-word lines stream their words sequentially (the cheap data-phase burst), then the CPU is acked.
 
 #### EBR Reset
 
@@ -681,12 +679,12 @@ Three steady-state states (entered once the reset sweep above finishes). `cpu_re
 ```
 
 - **idle**
-  - on a cache request, latch the index	`req_idx <= cpu_addr[9:2]` and tag `req_tag <= cpu_addr[23:10]`
+  - on a cache request, latch the `index`, `tag` and `word` offset sliced from `cpu_addr` (parametric fields, see Structure above)
     - `req_tag` is compared next cycle in `check`
   - latch the tag + data EBR reads (`tag_q <= tag_mem[idx]`, `data_q <= data_mem[idx]`) — synchronous, so the latch lands next cycle
 - **check**
-  - Index into `tag_mem`, then compare the tag bits and valid bit `(tag_q == {1'b1, req_tag})`
-  - On **hit**, then store the word data, ack the CPU `cpu_ready<=1`
+  - compare the address `tag` against all `WAYS` stored tags + valid bits in parallel `(tag_q[way] == {1'b1, req_tag})`
+  - On **hit**, select the hitting way and the `word` offset, store the word, ack the CPU `cpu_ready<=1`
   - On **miss**, then kick off a SPI flash read.
 - **fill**
   - hold the flash request until `spi_ready` when SPI read is done
@@ -765,110 +763,22 @@ However,
 
 #### Further Optimizations
 
-Two independent levers, and conflating them is the trap — they are *different kinds of win*:
+The parametric rewrite (geometry, associativity, multi-word lines, registered outputs) is **shipped** — see Structure above and `icache_tb.v`. Two levers remain open; don't conflate them.
 
-- **Hit latency** — paid on *every* fetch (our hot loops are ~100% hit), so a guaranteed but *small* CPI win on every benchmark.
-- **Miss behaviour** — invisible on our own ~100%-hit proxies, but the *only* thing that matters on the worst kernel — which is exactly what the geomean, and any cache-buster a rival submits, lands on. This is the **defensive** lever; the **Competition Strategy: offense & defense** section above is the adversarial *why*, and the rest of this subsection is the *design* reasoning behind it.
+> MODULAR CACHE IS SHIPPED!
 
-##### Hit latency (2 → 1 cycle): look-ahead, not combinational
+##### Hit latency (2 → 1 cycle) — *not built*
 
-The 2-cycle hit costs ~1 cycle vs SPRAM on every fetch, but removing it is **concentrated on branches / jumps / loads / stores** — *not* uniform: ALU-op fetches are already hidden by `spimemio` prefetch, so they gain nothing. Expect a modest win on control/memory-heavy code; measure before quoting a number.
+The 2-cycle hit costs ~1 cycle vs SPRAM on every fetch (concentrated on branch/jump/load/store; ALU fetches are already hidden by `spimemio` prefetch). The safe fix is **look-ahead** (`LOOKAHEAD_HIT`): pre-read the EBR off picorv32's `mem_la_addr` one cycle early and answer at T+1 with `cpu_ready` still **registered** — needs `mem_la_*` wired through `picosoc`. *Avoid* the combinational hit (`cpu_ready = (state==check) && hit`) — it routes the tag-compare straight into `mem_ready`, which **is** the critical path.
 
-- **Combinational hit = trap.** `assign cpu_ready = (state==check) && hit;` answers at *T+1* like SPRAM, but it routes EBR-out → tag-compare straight into `mem_ready` — which **is the critical path** (see **Critical Path** below). It buys a CPI cycle and pays it back in clock. Avoid while `mem_ready` is the bottleneck.
-- **Look-ahead = the safe version.** Wire picorv32's `mem_la_addr`/`mem_la_read` (presented one cycle early) through `picosoc` to the cache so it pre-reads EBR a cycle ahead and answers at T+1 with `cpu_ready` still **registered** — the same 1-cycle hit, with nothing new on the critical path. It's how synchronous memory is meant to be driven, and the only hit-latency change worth making here.
+##### Miss behaviour: cache sizing (still open tuning)
 
-##### Miss behaviour: size the cache as *insurance*
+Sizing is invisible on our ~100%-hit proxies but is the *only* thing that matters on the worst kernel / a rival cache-buster (see **Competition Strategy**). The geometry is parametric and currently **2-way × 4-word × 256-set**, but the final point isn't committed — and the two knobs cover *different* flanks (they don't substitute):
 
-The scored benchmarks are unknown and the binary is **frozen** — we see neither footprint nor layout, and can't relink. So cache sizing isn't a speedup on our proxies; it's an **insurance decision on the worst kernel**, which the geomean (and a deliberate cache-buster) both target.
+- **capacity / multi-word lines** → the footprint window (large hot code). Multi-word is the EBR-cheap capacity (fewer tags per word) and rides the shipped fast-read streaming. EBR is surplus; **LC is the ceiling (~88%)** — re-read nextpnr LC after any growth.
+- **associativity (`WAYS`)** → conflict/aliasing. A *constructed* stride-aliased attack 100%-misses a direct-mapped cache of **any** size; only ways are a structural fix.
 
-**Reason about the hot working set, not the program size.** A 16 MB image with a 600 B inner loop still hits ~100% in 1 KB — the cache only sees code that runs in steady state. The danger is a large *hot* footprint, and specifically **large + jumpy** (interpreter, big `switch`, many-function loop): a large *sequential* body streams from `spimemio` at qddr data-phase even when it overflows (≈1×), but a non-sequential body pays command+address+dummy *per miss* — many-fold vs a 2-cycle hit. That is what the cache is for.
-
-Each miss type maps to a hazard we can't control, and each has its *own* fix — capacity and associativity are **not interchangeable**:
-
-| Miss | Uncontrollable cause | Only real fix |
-| --- | --- | --- |
-| **Capacity** | hot footprint > cache | more capacity / multi-word lines |
-| **Conflict** | link layout — or a *deliberately* aliased benchmark | associativity (capacity only helps by luck) |
-| Compulsory | cold first touch | multi-word + fast-read |
-
-**Capacity vs associativity is a *resource* question — and our chip inverts the textbook default.** The 2:1 rule (2-way of size N ≈ direct-mapped of 2N) makes associativity look strictly better — but it's more efficient *per data-bit*, and data-bits are **EBR, which we have a surplus of**, while the scarce resource is **LC**. So for the *capacity* flank, a **bigger direct-mapped + multi-word** cache buys the robustness by spending the surplus at almost no LC — the resource-matched first move.
-
-**But the adversarial case flips 2-way back to essential.** Against *random* aliasing, a bigger direct-mapped cache (more sets) merely lowers the collision probability. Against a *constructed* attack — two hot blocks spaced exactly one cache-stride apart — a direct-mapped cache of **any size** still 100%-misses; only associativity is a structural defense. A rival can build exactly that, cheaply, so 2-way isn't "the better miss-rate spend," it's the **only** fix for the conflict flank. The two knobs therefore cover two *different* flanks: **capacity for the footprint window, associativity for the aliasing attack** — neither substitutes for the other.
-
-**Multi-word lines trade against set count.** Bigger blocks add spatial locality and amortise each miss's command+address over streamed words (direct synergy with fast-read) — but for a fixed tag budget they *reduce* the number of sets, raising conflict pressure. Fast-read makes the rarer, larger misses cheap, so it's a good trade for code; just note that leaning hard on multi-word is precisely when associativity starts earning its LC back.
-
-**Keep the cache outputs registered.** With `cpu_ready`/`cpu_rdata` registered, the EBR-read → tag-compare → way/word-mux is an internal FF→FF path *with slack* — off the `mem_ready` critical path. That one discipline is what makes capacity, ways, and block size all **fmax-safe**, and it's the same reason the combinational-hit tweak above is a trap.
-
-**Measure the sizes; don't fix them here.** The capacity / ways / words are *outputs* of measurement, not design inputs — so this spec deliberately leaves them open:
-
-- a **footprint-sweep proxy** (parameterise `bench_interp`'s handler size, or add a `bench_bigjump`) to find the *capacity knee* — where hit rate falls off a cliff;
-- a **conflict probe** (two hot regions placed exactly one cache-stride apart) to confirm whether associativity actually earns its LC over a bigger direct-mapped cache.
-
-Size to the measured knee with margin (and past a plausible rival cache — see the offense pick in **Competition Strategy**), rather than guessing.
-
-**The spec.** A parameterised read-only cache — `SETS × WAYS × WORDS_PER_LINE` exposed as params (one knob, like `ENABLE_ICACHE`), with **registered outputs**. The design commitments — the parts that are *not* up for tuning — are:
-
-1. **Grow into the idle EBR.** The current 1 KB is small by accident, not constraint; EBR is the surplus resource.
-2. **Multi-word lines.** Convert the fast-read streaming we already shipped into cheaper misses.
-3. **`WAYS` as a parameter.** Associativity becomes a measured experiment (footprint sweep vs conflict probe), turned on for the aliasing flank without a rewrite — not a default guessed up front.
-4. **Registered outputs.** Non-negotiable, to keep the whole structure off the `mem_ready` critical path.
-
-Every concrete figure that appears anywhere in this doc (4 KB? 8 KB? 2-way? 4-word lines?) is **illustrative** — the final point falls out of the sweeps above against the LC/EBR budget at the time.
-
-##### Implementation plan
-
-Realise the spec as **one** module — `icache.v` rewritten geometry- *and* latency-parametric — so capacity, associativity, line size, and the 1-cycle hit are all the *same* design, swept not rewritten. The defaults reproduce today's cache **byte-identical**, so the whole ladder lives behind `ENABLE_ICACHE`, A/B-testable and revertible one param at a time.
-
-**Parameters** (powers of two; plumbed `icebreaker.v` → `picosoc.v` → `icache`):
-
-| Param | Default (= today) | Meaning |
-| --- | :-: | --- |
-| `SETS` | 256 | index entries |
-| `WAYS` | 1 | associativity (1 = direct-mapped) |
-| `WORDS_PER_LINE` | 1 | words per line (spatial locality / streamed-miss amortisation) |
-| `LOOKAHEAD_HIT` | 0 | 1 ⇒ pre-read EBR off `mem_la_addr` ⇒ 1-cycle hit (the look-ahead lever above), `cpu_ready` still registered |
-
-Capacity = `SETS × WAYS × WORDS_PER_LINE` words × 4 B (today 256·1·1 = 1 KB).
-
-**Derived address split** — all `localparam` off the params, so one edit re-slices everything. With `i = log2(SETS)`, `w = log2(WORDS_PER_LINE)` on `cpu_addr[23:0]`:
-
-```text
- tag [23 : 2+i+w] | index [1+i+w : 2+w] | word [1+w : 2] | byte [1:0]
-```
-
-Defaults (`i=8, w=0`) give `tag[23:10] | index[9:2] | byte[1:0]` — exactly today, so Stage 0 is provably a no-op.
-
-**Storage & EBR cost** (yosys infers `SB_RAM40_4K`: 4 Kbit, ≤16-bit wide ⇒ a 32-bit word spans 2 blocks, 256 deep each). Use these to size a config into the **23 idle EBR** (but **LC is the real ceiling — 88%** — so re-read nextpnr LC after every stage):
-
-- data: `SETS·WAYS·WORDS_PER_LINE` words ⇒ `ceil(words/256) × 2` EBR.
-- tag+valid: `SETS·WAYS` entries × `(1+tag)` bits ⇒ `ceil(entries/256) × ceil((1+tag)/16)` EBR.
-- **multi-word is the EBR-cheap capacity** (fewer tags per word): 4 KB as 256·1·**4** = 8 data + **1** tag EBR, vs 4 KB as 1024·1·1 = 8 data + **4** tag EBR.
-
-**Read / hit path** (registered out — keeps the EBR-read→compare→way/word-mux an internal FF→FF path with slack, off `mem_ready`):
-
-1. read all `WAYS` tags + the offset-selected word of each way in parallel — off the **look-ahead** index when `LOOKAHEAD_HIT`, else off `cpu_addr` (the current 2-cycle path);
-2. compare the `WAYS` tags against the **actual `cpu_addr` tag** (never the staged tag — a stale pre-read can then only *miss*, never false-hit: the freeze-mode guard);
-3. one-hot way-select → `WORDS_PER_LINE:1` word-mux → `cpu_rdata`; assert registered `cpu_ready`.
-
-**Replacement** (`WAYS>1`): one **use-bit per set** for 2-way (evict the not-recently-used way; flip on hit/fill — `SETS` FFs). Stay 2-way unless the conflict probe demands more (then tree-PLRU). Direct-mapped: none.
-
-**Miss / fill (multi-word, rides the shipped fast-read):** stream `WORDS_PER_LINE` sequential words from `spimemio` (increment `spi_addr` — the cheap data-phase burst), write them into the victim way's line, set its tag valid + update the use-bit, ack. Start with *fill-line-then-ack*; critical-word-first is an optional latency tweak.
-
-**EBR-reset sweep** generalises unchanged: clear every `(set, way)` valid bit after reset before the first lookup (silicon powers up undefined).
-
-**Staged rollout — one param per stage, verify + measure after each** (never bundle; an un-attributable gain/regression is the whole trap):
-
-| Stage | Flip | What it buys | Gate |
-| :-: | --- | --- | --- |
-| 0 | refactor to parametric, defaults = today | nothing (safety net) | boot/trap + checksums **byte-identical** to baseline |
-| 1 | grow `SETS` (e.g. 4 KB direct) | capacity flank | fmax + **LC** |
-| 2 | `WORDS_PER_LINE` = 2/4 | cheaper `cold`/`interp` misses | set-count vs conflict |
-| 3 | `WAYS` = 2 + use-bit | conflict/aliasing flank | LC, fmax |
-| 4 | `LOOKAHEAD_HIT` = 1 | hot-loop CPI (every benchmark) | `cpu_ready` stays FF; re-check fmax |
-
-> **Verification** (each stage): defaults/knob-off rebuild stays baseline `SIM PASS`; boot trap-silent + on-board checksums (`matmul`=204 …); new `cache_tb.v` asserts **no false-hit** (a hit's `cpu_rdata` equals the word `spimemio` holds for that line), **hit latency** = 1 with `LOOKAHEAD_HIT` (else 2), and correct multi-word fill; drive the **footprint-sweep** + **conflict-probe** proxies to *place* the geometry; re-run `lookahead_tb` (decode unaffected) and re-read fmax + LC. Full-count checksums confirmed on-board.
-
-**Files:** `icache.v` (parametric rewrite), `picosoc.v` (params + `mem_la_*` wiring, shared with Step 1a-i), `icebreaker.v` (top knobs), `cache_tb.v` (new).
+Remaining work is **measurement, not design**: a footprint-sweep proxy (parameterise `bench_interp`'s handler size) to find the capacity knee, and a conflict probe (two hot regions one cache-stride apart) to decide whether `WAYS=2` earns its LC. Size to the measured knee with margin (past a plausible rival cache). Correctness/hit-miss/invalidation across geometries is already covered by `icache_tb.v`.
 
 ### Incremental CPI reductions
 
@@ -944,7 +854,7 @@ wire pll_locked;
 SB_PLL40_PAD #(
     .FEEDBACK_PATH("SIMPLE"),
     .DIVR(4'b0000),       // = 0
-    .DIVF(7'b0110000),    // = 48
+    .DIVF(7'b0101101),    // = 45
     .DIVQ(3'b101),        // = 5
     .FILTER_RANGE(3'b001)
 ) pll (
@@ -959,7 +869,7 @@ SB_PLL40_PAD #(
 **The frequency** is set by three dividers (run `icepll -i 12 -o <ideal_freq>` to get valid values for a new target):
 
 $$
-f_{out} = f_{ref}\,\frac{DIVF+1}{(DIVR+1)\,2^{DIVQ}} = 12\,\frac{49}{32} = 18.375\text{ MHz}
+f_{out} = f_{ref}\,\frac{DIVF+1}{(DIVR+1)\,2^{DIVQ}} = 12\,\frac{46}{32} = 17.25\text{ MHz}
 $$
 
 Physical constraints bound our divider values: the **VCO** ($f_{ref}\frac{DIVF+1}{DIVR+1}$) must stay in **533–1066 MHz**, the phase-detector input ≥ 10 MHz, and the **PLL output floor is 16 MHz**. Lock takes ≤ 50 µs (the reason for the reset-until-`pll_locked` gate).

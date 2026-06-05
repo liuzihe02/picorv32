@@ -58,6 +58,9 @@ uint8_t bench_memcpy(void);
 uint8_t bench_chase(void);
 uint8_t bench_hot(void);
 uint8_t bench_cold(void);
+uint8_t bench_seq_sm(void);
+uint8_t bench_seq_md(void);
+uint8_t bench_seq_lg(void);
 
 uint8_t bench_bubble_sort(void);
 uint8_t bench_matmul(void);

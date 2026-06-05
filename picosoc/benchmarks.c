@@ -200,6 +200,52 @@ uint8_t bench_cold(void)  // large straight-line body -> footprint > cache
 	return (uint8_t)(acc ^ x);
 }
 
+// ---- Cache-geometry sweep (instruction fetch) --------------------------------
+// The I-cache is instruction-only, so these probe it purely via CODE footprint:
+// a straight-line (sequential-PC) body re-run in a loop, in three graduated
+// sizes (small/mid/large). Sweep the cache params (SETS / WAYS / WORDS_PER_LINE
+// in picosoc.v + icebreaker.v), rebuild, and watch the CPI of seq_sm/md/lg:
+//
+//   * CAPACITY knee -- the smallest body whose CPI jumps is the one that just
+//     exceeds your cache (= SETS*WAYS*WORDS_PER_LINE*4 bytes). A bigger cache
+//     moves the knee to a larger body.
+//   * WORDS_PER_LINE (multi-word) -- ABOVE the knee, a wider line prefetches
+//     sequential neighbours, so misses drop ~Nx. Bigger WORDS lowers CPI on
+//     seq_md / seq_lg. (No effect on a body that already fits.)
+//   * WAYS (associativity) -- a body ~1-2x capacity THRASHES a direct-mapped
+//     cache (its 2nd half evicts the 1st every pass) but FITS in a 2-way one.
+//     Compare at EQUAL capacity, e.g. SETS=256/WAYS=1/WORDS=4 (4 KB) vs
+//     SETS=128/WAYS=2/WORDS=4 (4 KB): the body in that 1-2x window (usually
+//     seq_md) drops sharply going 1-way -> 2-way; seq_lg stays thrashed (too
+//     big for either).
+//
+// Footprints are ~O0 code size, so absolute KB is approximate -- READ THESE BY
+// COMPARING ACROSS CONFIGS, not in isolation. Loop counts keep total work
+// (~256k COLD1 steps) roughly equal so the dashboard is readable. seq_lg
+// builds a large (~tens of KB) function; that is fine -- it lives in flash.
+#define COLD256(x) COLD64(x) COLD64(x) COLD64(x) COLD64(x)
+
+uint8_t bench_seq_sm(void)   // small body: fits most caches -> hit baseline
+{
+	uint32_t x = 0xABCDEFu, acc = 0;
+	for (uint32_t r = 0; r < 4000u; r++) { COLD64(x) acc ^= x; }            //   64 steps
+	return (uint8_t)(acc ^ x);
+}
+
+uint8_t bench_seq_md(void)   // ~6 KB body: lands in the 1-2x window for a 4 KB cache
+{                            // -> thrashes direct-mapped, fits 2-way (the WAYS demo)
+	uint32_t x = 0xABCDEFu, acc = 0;
+	for (uint32_t r = 0; r < 1300u; r++) { COLD64(x) COLD64(x) COLD64(x) acc ^= x; } //  192 steps
+	return (uint8_t)(acc ^ x);
+}
+
+uint8_t bench_seq_lg(void)   // ~16 KB body: exceeds typical caches (both 1- and 2-way)
+{
+	uint32_t x = 0xABCDEFu, acc = 0;
+	for (uint32_t r = 0; r < 500u; r++) { COLD256(x) COLD256(x) acc ^= x; } //  512 steps
+	return (uint8_t)(acc ^ x);
+}
+
 // ===== Programs =========================================================
 
 static int32_t sbuf[64];
@@ -446,6 +492,9 @@ const bench_t bench_table[] = {
 	{ "chase",       1, "",             bench_chase },
 	{ "hot",         2, "",             bench_hot },
 	{ "cold",        2, "",             bench_cold },
+	{ "seq_sm",      2, "fits",         bench_seq_sm },
+	{ "seq_md",      2, "WAYS/WORDS",   bench_seq_md },
+	{ "seq_lg",      2, ">cache",       bench_seq_lg },
 	{ "bubble_sort", 3, "branch/ld-st", bench_bubble_sort },
 	{ "matmul",      3, "mul/ld-st",    bench_matmul },
 	{ "crc32",       3, "shift/xor",    bench_crc32 },

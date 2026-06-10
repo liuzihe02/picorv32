@@ -225,6 +225,45 @@ strsearch     127429678   1568299   81.25   200   ld/branch
 done
 ```
 
+## Final Benchmarks
+
+```txt
+
+clock = 22.875 MHz
+
+benchmark     |     cycles |   instrs |    CPI | wallclock (ms) | chk | mix
+--------------+------------+----------+--------+----------------+-----+----
+-- Compute --
+alu           |   10850666 |  1850038 |   5.86 |        474.346 |  82 | 
+shift         |   10250585 |  1700031 |   6.02 |        448.113 |   0 | 
+mul           |   10900673 |  2050038 |   5.31 |        476.532 | 124 | 
+div           |   10280519 |  1240032 |   8.29 |        449.421 | 183 | 
+branch        |   18075652 |  2974936 |   6.07 |        790.192 |  64 | 
+call          |   23750628 |  4100028 |   5.79 |       1038.278 |  32 | 
+-- Memory --
+memcpy        |    5321619 |   930068 |   5.72 |        232.639 |  64 | 
+chase         |    5224518 |   904386 |   5.77 |        228.394 | 136 | 
+-- Fetch --
+hot           |   23000471 |  4000027 |   5.75 |       1005.485 | 117 | 
+cold          |    5255722 |  1029530 |   5.10 |        229.758 | 239 | 
+seq_sm        |   10502025 |  2092031 |   5.02 |        459.104 | 239 | fits
+seq_md        |   10071358 |  2011130 |   5.00 |        440.277 | 239 | WAYS/WORDS
+seq_lg        |   14946451 |  2053530 |   7.27 |        653.396 | 239 | >cache
+-- Programs --
+bubble_sort   |    4125728 |   756032 |   5.45 |        180.359 |  77 | branch/ld-st
+matmul        |   16233970 |  2922496 |   5.55 |        709.681 | 204 | mul/ld-st
+crc32         |   16610300 |  3075453 |   5.40 |        726.133 |   0 | shift/xor
+prime_count   |    4701427 |   521375 |   9.01 |        205.526 | 141 | div/branch
+fir           |   23804543 |  4328124 |   5.49 |       1040.635 | 214 | mul/shift
+strsearch     |    8801953 |  1568299 |   5.61 |        384.784 | 200 | ld/branch
+interp        |   17381709 |  3909943 |   4.44 |        759.856 |  78 | jump/branch
+game_of_life  |  127298978 | 23041099 |   5.52 |       5564.982 |  33 | branch/ld-st
+fib_rec       |   15251319 |  2755365 |   5.53 |        666.724 | 179 | call/ld-st
+xorshift_mc   |   51177146 |  8235354 |   6.21 |       2237.252 |  65 | mul/shift
+done
+
+```
+
 ## Competition Strategy: offense & defense
 
 Each group submits a **secret benchmark** for cross-evaluation: our CPU runs *their* kernel and vice-versa. The whole attack surface is the **instruction-fetch stream** — all data lives in 128 KB SPRAM that answers in 1 cycle regardless of footprint (no D-cache to thrash), so the classic pointer-chase killer does nothing to us. The build constraint (`-nostdlib -march=rv32im`) also bounds their weapons: floats and 64-bit division won't link, so adversaries are confined to 32-bit-integer ops + fetch patterns, and "fail" means *catastrophically slow*, not *wrong*.

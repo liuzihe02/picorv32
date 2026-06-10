@@ -38,3 +38,5 @@
 
 #ignore pycache
 __pycache__/
+
+sim_build/

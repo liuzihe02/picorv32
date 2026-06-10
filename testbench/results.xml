@@ -1,0 +1,6 @@
+<testsuites name="results">
+  <testsuite name="all" package="all">
+    <property name="random_seed" value="1781134896" />
+    <testcase name="test_handshake" classname="test_handshake" file="/Users/galen/projects/gb3/picorv32/testbench/test_handshake.py" lineno="53" time="0.17783808708190918" sim_time_ns="2070.0" ratio_time="11639.801315713621" />
+  </testsuite>
+</testsuites>

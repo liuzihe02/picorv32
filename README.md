@@ -12,6 +12,23 @@ We used the `iCE40UP5K`, compiled with `oss-cad-suite` and `rv32im` ISA. Competi
 
 Refer to the [README-GB3](/README-GB3.md) file for our implementation plan, and the technical guide [pdf](/guide/guide.pdf) for deep-dive on microarchitecture and technical background.
 
+## Core Files
+
+Core files modified, refer to [README-GB3](/README-GB3.md) for the most important files.
+
+| File | Role |
+| --- | --- |
+| `picorv32.v` | CPU core. Main module `picorv32`; also `picorv32_pcpi_mul/fast_mul/div`, `picorv32_regs`, `picorv32_axi`, `picorv32_wb`. |
+| `picosoc/spimemio.v` | SPI flash controller — the dominant fetch-latency block: fast-read reset defaults, jump penalty, line-buffer insertion point. |
+| `picosoc/icebreaker.v` | Top-level for the iCEBreaker board: instantiates `picosoc` (iCE40UP5K config, SPRAM, 7-seg; no PLL, raw 12 MHz). Current rv32im params: `BARREL_SHIFTER=0`, `ENABLE_MUL=0`, `ENABLE_DIV=1`, `ENABLE_FAST_MUL=1`, `ENABLE_COMPRESSED=0`, `ENABLE_ICACHE` (cache on/off). |
+| `picosoc/picosoc.v` | SoC wrapper. Wires CPU to SRAM, UART, SPI flash, GPIO. Address decode + memory map live here; the `icache` sits on this bus between the CPU and `spimemio`. |
+| `picosoc/icache.v` | MAIN Instruction cache Verilog file: parametric `SETS`×`WAYS`×`WORDS_PER_LINE` (direct-mapped or set-associative, multi-word lines), EBR-backed. Currently built 2-way × 1-word × 1024-set (8 KB). Intercepts the flash-region fetch path. |
+| `README.md` | Full documentation of all configuration parameters. |
+| `picosoc/README.md` | picosoc documentation. |
+| `picosoc/benchmarks.c` | benchmark suite |
+| `picosoc/benchmarks.h` | benchmark suite header file. |
+| `testbench/` | full coverage of functional verification |
+
 ---
 [![.github/workflows/ci.yml](https://github.com/YosysHQ/picorv32/actions/workflows/ci.yml/badge.svg)](https://github.com/YosysHQ/picorv32/actions/workflows/ci.yml)
 

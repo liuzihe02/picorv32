@@ -546,7 +546,7 @@ mem_rdata = priority-mux in the same order
 
   \node[blk, fill=green!18, minimum height=1.0cm, minimum width=1.9cm,
         draw=green!50!black, thick, dashed]
-        (cache) at (6.5, 2.4) {Instr Cache\\{\tiny 256$\times$32 EBR}};
+        (cache) at (6.5, 2.4) {Instr Cache\\{\tiny 2-way$\times$1024 set, 8 KB EBR}};
 
   \node[blk, fill=blue!16]  (flash)  at (9.6, 2.4) {spimemio\\SPI Flash};
   \node[blk, fill=blue!22]  (spram)  at (9.6, 1.0) {SPRAM\\128\,KB};
@@ -569,12 +569,13 @@ mem_rdata = priority-mux in the same order
   \draw[arr] (adec.east |- iomem) -- (iomem.west)
     node[midway, flbl] {\texttt{[31:24]>0x01}};
 
-  \node[blk, fill=gray!15, minimum width=1.4cm] (gpio) at (13.0, -1.1) {LEDs};
-  \node[blk, fill=gray!15, minimum width=1.4cm] (sevs) at (13.0, -2.2) {7-seg};
+  \node[blk, fill=gray!15, minimum width=1.4cm, minimum height=0.5cm] (gpio) at (13.0, -1.5) {LEDs};
+  \node[blk, fill=gray!15, minimum width=1.4cm, minimum height=0.5cm] (sevs) at (13.0, -2.2) {7-seg};
 
+  % LEDs level with iomem -> top arrow is a straight horizontal run (label clear of the branch)
   \draw[arr] (iomem.east) -- ++(0.4, 0) coordinate (iofan);
-  \draw[arr] (iofan) |- (gpio.west)
-    node[pos=0.25, above, lbl] {\texttt{0x03..}};
+  \draw[arr] (iofan) -- (gpio.west)
+    node[midway, above, lbl] {\texttt{0x03..}};
   \draw[arr] (iofan) |- (sevs.west);
 
   \begin{scope}[on background layer]
@@ -820,7 +821,7 @@ Needs separate instruction/data paths (cache + SPRAM, distinguished by `mem_inst
 
 #### PLL
 
-The board only supplies a raw **12 MHz** crystal on the clock pad. The iCE40's hard **PLL** (`SB_PLL40_PAD`) multiplies that reference up to a faster system clock — currently **~17.25 MHz** (`DIVF`=45), a touch below the ~18.5 MHz $f_{max}$ ceiling. We retune this often, so the live value lives in `DIVF` (`icebreaker.v`) and `F_CLK_HZ` (`benchmarks.h`), not in this prose. Refer to the `SB_PLL40_PAD` code block in `icebreaker.v`:
+The board only supplies a raw **12 MHz** crystal on the clock pad. The iCE40's hard **PLL** (`SB_PLL40_PAD`) multiplies that reference up to a faster system clock — currently **22.875 MHz** (`DIVF`=60), under the ceiling lifted by the `-noabc9` synthesis flow (was ~18.5 MHz with abc9). We retune this often, so the live value lives in `DIVF` (`icebreaker.v`) and `F_CLK_HZ` (`benchmarks.h`), not in this prose. Refer to the `SB_PLL40_PAD` code block in `icebreaker.v`:
 
 ```verilog
 module icebreaker (
@@ -834,7 +835,7 @@ wire pll_locked;
 SB_PLL40_PAD #(
     .FEEDBACK_PATH("SIMPLE"),
     .DIVR(4'b0000),       // = 0
-    .DIVF(7'b0101101),    // = 45
+    .DIVF(7'b0111100),    // = 60
     .DIVQ(3'b101),        // = 5
     .FILTER_RANGE(3'b001)
 ) pll (
@@ -849,7 +850,7 @@ SB_PLL40_PAD #(
 **The frequency** is set by three dividers (run `icepll -i 12 -o <ideal_freq>` to get valid values for a new target):
 
 $$
-f_{out} = f_{ref}\,\frac{DIVF+1}{(DIVR+1)\,2^{DIVQ}} = 12\,\frac{46}{32} = 17.25\text{ MHz}
+f_{out} = f_{ref}\,\frac{DIVF+1}{(DIVR+1)\,2^{DIVQ}} = 12\,\frac{61}{32} = 22.875\text{ MHz}
 $$
 
 Physical constraints bound our divider values: the **VCO** ($f_{ref}\frac{DIVF+1}{DIVR+1}$) must stay in **533–1066 MHz**, the phase-detector input ≥ 10 MHz, and the **PLL output floor is 16 MHz**. Lock takes ≤ 50 µs (the reason for the reset-until-`pll_locked` gate).
@@ -875,7 +876,7 @@ The achievable clock is the **minimum** of several independent limits:
 
 | Limit | Freq | Binding when… |
 | --- | ---: | --- |
-| **Logic critical path** | **~18.5 MHz (now)** | **currently** — see Critical Path below |
+| **Logic critical path** | **~18.5 MHz (abc9); lifted by `-noabc9`** | **currently** — read the live figure from `icebreaker.rpt`; see Critical Path below |
 | DSP `MULT16×16` (pipeline bypassed) | 50 MHz | once logic < 20 ns; `pcpi_fast_mul` maps to the DSP, clocked at `clk` |
 | SPRAM read/write | 70 MHz | once the DSP is pipelined or fast-mul dropped |
 | EBR / regfile | 150 MHz | never binding here |
@@ -885,7 +886,7 @@ The achievable clock is the **minimum** of several independent limits:
 - check `icebreaker.rpt` (icetime): `Total path delay: 54.18 ns (18.46 MHz)`
 - nextpnr (print to terminal after synth) also prints `Max frequency for clock ...: 19.94 MHz (PASS at 18.38 MHz)` to stdout.
 
-**We currently clock 17.25 MHz (`DIVF`=45) against the ~18.5 MHz critical-path ceiling** — so there's a sliver of unused PLL headroom (Step 0 in Critical Path below), and the logic path is the wall above that.
+**We currently clock 22.875 MHz (`DIVF`=60)**, past the old ~18.5 MHz abc9 ceiling thanks to the `-noabc9` flow — re-read the live ceiling from `icebreaker.rpt` after each build; the logic path is still the wall above that.
 - **Shorten the critical path** to lift the ceiling, then the next bottleneck is the DSP at 50 MHz. The lever is *not* `TWO_CYCLE_ALU` (the ALU isn't on the path) — see the [Critical Path](#critical-path) diagnosis and plan below.
 
 The payoff is large because the PLL speeds *everything* linearly in wall-clock (including flash, since SCK = clk/2). But it's **gated on critical-path work**, which is why the cache (works today) comes first and `T_c` tweaks are enablers.
